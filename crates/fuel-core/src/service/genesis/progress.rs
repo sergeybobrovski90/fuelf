@@ -1,8 +1,9 @@
-use std::{
-    borrow::Cow,
-    io::IsTerminal,
-};
+use std::io::IsTerminal;
 
+use fuel_core_storage::{
+    kv_store::StorageColumn,
+    structured_storage::TableWithBlueprint,
+};
 use indicatif::{
     HumanDuration,
     MultiProgress,
@@ -98,19 +99,19 @@ impl MultipleProgressReporter {
         }
     }
 
-    pub fn table_reporter(
-        &self,
-        num_groups: Option<usize>,
-        desc: impl Into<Cow<'static, str>>,
-    ) -> ProgressReporter {
+    pub fn table_reporter<T>(&self, num_groups: Option<usize>) -> ProgressReporter
+    where
+        T: TableWithBlueprint,
+    {
+        let desc = T::column().name();
         let target = if Self::should_display_bars() {
-            ReportMethod::VisualBar(desc.into().into_owned())
+            ReportMethod::VisualBar(desc.to_owned())
         } else {
             let span = tracing::span!(
                 parent: &self.span,
                 Level::INFO,
                 "task",
-                migration = desc.into().as_ref()
+                migration = desc
 
             );
             ReportMethod::Logs(span)

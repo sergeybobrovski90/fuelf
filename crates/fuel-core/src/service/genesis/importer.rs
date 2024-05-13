@@ -1,19 +1,13 @@
+use self::import_task::ImportTable;
+
 use super::{
     progress::MultipleProgressReporter,
     task_manager::TaskManager,
 };
 use crate::{
     combined_database::CombinedGenesisDatabase,
-    database::database_description::{
-        off_chain::OffChain,
-        on_chain::OnChain,
-    },
     fuel_core_graphql_api::storage::messages::SpentMessages,
     graphql_api::storage::{
-        blocks::FuelBlockIdsToHeights,
-        coins::OwnedCoins,
-        contracts::ContractsInfo,
-        messages::OwnedMessageIds,
         old::{
             OldFuelBlockConsensus,
             OldFuelBlocks,
@@ -25,7 +19,6 @@ use crate::{
         },
     },
 };
-use core::marker::PhantomData;
 use fuel_core_chain_config::{
     AsTable,
     SnapshotReader,
@@ -34,7 +27,6 @@ use fuel_core_chain_config::{
 };
 use fuel_core_services::StateWatcher;
 use fuel_core_storage::{
-    kv_store::StorageColumn,
     structured_storage::TableWithBlueprint,
     tables::{
         Coins,
@@ -56,14 +48,10 @@ use fuel_core_types::{
     },
     fuel_types::BlockHeight,
 };
-use import_task::{
-    ImportTable,
-    ImportTask,
-};
+use itertools::Itertools;
 
 mod import_task;
-mod off_chain;
-mod on_chain;
+mod logic;
 
 const GROUPS_NUMBER_FOR_PARALLELIZATION: usize = 10;
 
@@ -106,89 +94,51 @@ impl SnapshotImporter {
 
     async fn run_workers(mut self) -> anyhow::Result<()> {
         tracing::info!("Running imports");
-        self.spawn_worker_on_chain::<Coins>()?;
-        self.spawn_worker_on_chain::<Messages>()?;
-        self.spawn_worker_on_chain::<ContractsRawCode>()?;
-        self.spawn_worker_on_chain::<ContractsLatestUtxo>()?;
-        self.spawn_worker_on_chain::<ContractsState>()?;
-        self.spawn_worker_on_chain::<ContractsAssets>()?;
-        self.spawn_worker_on_chain::<ProcessedTransactions>()?;
+        macro_rules! start_imports {
+            ($($table:ty),*) => {
+                let names_unique = [
+                    $(
+                        fuel_core_storage::kv_store::StorageColumn::name(&<$table>::column()),
+                    )*
+                ].iter().all_unique();
 
-        self.spawn_worker_off_chain::<TransactionStatuses, TransactionStatuses>()?;
-        self.spawn_worker_off_chain::<OwnedTransactions, OwnedTransactions>()?;
-        self.spawn_worker_off_chain::<SpentMessages, SpentMessages>()?;
-        self.spawn_worker_off_chain::<Messages, OwnedMessageIds>()?;
-        self.spawn_worker_off_chain::<Coins, OwnedCoins>()?;
-        self.spawn_worker_off_chain::<FuelBlocks, OldFuelBlocks>()?;
-        self.spawn_worker_off_chain::<Transactions, OldTransactions>()?;
-        self.spawn_worker_off_chain::<SealedBlockConsensus, OldFuelBlockConsensus>()?;
-        self.spawn_worker_off_chain::<Transactions, ContractsInfo>()?;
-        self.spawn_worker_off_chain::<OldTransactions, ContractsInfo>()?;
-        self.spawn_worker_off_chain::<OldFuelBlocks, OldFuelBlocks>()?;
-        self.spawn_worker_off_chain::<OldFuelBlockConsensus, OldFuelBlockConsensus>()?;
-        self.spawn_worker_off_chain::<OldTransactions, OldTransactions>()?;
-        self.spawn_worker_off_chain::<FuelBlocks, FuelBlockIdsToHeights>()?;
-        self.spawn_worker_off_chain::<OldFuelBlocks, FuelBlockIdsToHeights>()?;
+                if !names_unique {
+                    panic!("Tables must have unique column names because they are used as keys to track the genesis progress both in on-chain and off-chain tables.");
+                }
+
+                $(self.start_import::<$table>()?;)*
+            };
+        }
+        start_imports!(
+            Coins,
+            ContractsAssets,
+            ContractsLatestUtxo,
+            ContractsRawCode,
+            ContractsState,
+            FuelBlocks,
+            Messages,
+            OldFuelBlockConsensus,
+            OldFuelBlocks,
+            OldTransactions,
+            OwnedTransactions,
+            ProcessedTransactions,
+            SealedBlockConsensus,
+            SpentMessages,
+            TransactionStatuses,
+            Transactions
+        );
 
         self.task_manager.wait().await?;
 
         Ok(())
     }
 
-    pub fn spawn_worker_on_chain<TableBeingWritten>(&mut self) -> anyhow::Result<()>
+    pub fn start_import<TableInSnapshot>(&mut self) -> anyhow::Result<()>
     where
-        TableBeingWritten: TableWithBlueprint + 'static + Send,
-        TableEntry<TableBeingWritten>: serde::de::DeserializeOwned + Send,
-        StateConfig: AsTable<TableBeingWritten>,
-        Handler<TableBeingWritten, TableBeingWritten>:
-            ImportTable<TableInSnapshot = TableBeingWritten, DbDesc = OnChain>,
-    {
-        let groups = self.snapshot_reader.read::<TableBeingWritten>()?;
-        let num_groups = groups.len();
-
-        // Even though genesis is expected to last orders of magnitude longer than an empty task
-        // might take to execute, this optimization is placed regardless to speed up
-        // unit/integration tests that will feel the impact more than actual regenesis.
-        if num_groups == 0 {
-            return Ok(());
-        }
-
-        let block_height = *self.genesis_block.header().height();
-        let da_block_height = self.genesis_block.header().da_height;
-        let db = self.db.on_chain().clone();
-
-        let migration_name = migration_name::<TableBeingWritten, TableBeingWritten>();
-        let progress_reporter = self
-            .multi_progress_reporter
-            .table_reporter(Some(num_groups), migration_name);
-
-        let task = ImportTask::new(
-            Handler::new(block_height, da_block_height),
-            groups,
-            db,
-            progress_reporter,
-        );
-
-        let import = |token| task.run(token);
-        if num_groups < GROUPS_NUMBER_FOR_PARALLELIZATION {
-            self.task_manager.run(import)?;
-        } else {
-            self.task_manager.spawn_blocking(import);
-        }
-
-        Ok(())
-    }
-
-    pub fn spawn_worker_off_chain<TableInSnapshot, TableBeingWritten>(
-        &mut self,
-    ) -> anyhow::Result<()>
-    where
-        TableInSnapshot: TableWithBlueprint + Send + 'static,
+        TableInSnapshot: TableWithBlueprint + 'static + Send,
         TableEntry<TableInSnapshot>: serde::de::DeserializeOwned + Send,
         StateConfig: AsTable<TableInSnapshot>,
-        Handler<TableBeingWritten, TableInSnapshot>:
-            ImportTable<TableInSnapshot = TableInSnapshot, DbDesc = OffChain>,
-        TableBeingWritten: TableWithBlueprint + Send + 'static,
+        Handler: ImportTable<TableInSnapshot>,
     {
         let groups = self.snapshot_reader.read::<TableInSnapshot>()?;
         let num_groups = groups.len();
@@ -203,20 +153,23 @@ impl SnapshotImporter {
         let block_height = *self.genesis_block.header().height();
         let da_block_height = self.genesis_block.header().da_height;
 
-        let db = self.db.off_chain().clone();
+        let on_chain_db = self.db.on_chain().clone();
+        let off_chain_db = self.db.off_chain().clone();
 
-        let migration_name = migration_name::<TableInSnapshot, TableBeingWritten>();
         let progress_reporter = self
             .multi_progress_reporter
-            .table_reporter(Some(num_groups), migration_name);
+            .table_reporter::<TableInSnapshot>(Some(num_groups));
 
-        let task = ImportTask::new(
-            Handler::new(block_height, da_block_height),
-            groups,
-            db,
-            progress_reporter,
-        );
-        let import = |token| task.run(token);
+        let import = move |token| {
+            import_task::import_entries(
+                token,
+                Handler::new(block_height, da_block_height),
+                groups,
+                on_chain_db,
+                off_chain_db,
+                progress_reporter,
+            )
+        };
         if num_groups < GROUPS_NUMBER_FOR_PARALLELIZATION {
             self.task_manager.run(import)?;
         } else {
@@ -228,32 +181,16 @@ impl SnapshotImporter {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Handler<TableBeingWritten, TableInSnapshot> {
+pub struct Handler {
     pub block_height: BlockHeight,
     pub da_block_height: DaBlockHeight,
-    _table_being_written: PhantomData<TableBeingWritten>,
-    _table_in_snapshot: PhantomData<TableInSnapshot>,
 }
 
-impl<A, B> Handler<A, B> {
+impl Handler {
     pub fn new(block_height: BlockHeight, da_block_height: DaBlockHeight) -> Self {
         Self {
             block_height,
             da_block_height,
-            _table_being_written: PhantomData,
-            _table_in_snapshot: PhantomData,
         }
     }
-}
-
-pub fn migration_name<TableInSnapshot, TableBeingWritten>() -> String
-where
-    TableInSnapshot: TableWithBlueprint,
-    TableBeingWritten: TableWithBlueprint,
-{
-    format!(
-        "{} -> {}",
-        TableInSnapshot::column().name(),
-        TableBeingWritten::column().name()
-    )
 }

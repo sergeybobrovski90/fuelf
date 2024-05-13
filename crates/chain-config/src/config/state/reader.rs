@@ -23,6 +23,14 @@ impl<T> Groups<T>
 where
     T: Mappable,
 {
+    pub fn new(items: Vec<anyhow::Result<Vec<TableEntry<T>>>>) -> Self {
+        Self {
+            iter: GroupIter::InMemory {
+                groups: items.into_iter(),
+            },
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.iter {
             GroupIter::InMemory { groups } => groups.len(),

@@ -1,20 +1,23 @@
+use std::borrow::Cow;
+
 use anyhow::bail;
 use fuel_core_chain_config::TableEntry;
 use fuel_core_storage::{
+    kv_store::StorageColumn,
     structured_storage::TableWithBlueprint,
     transactional::{
-        Modifiable,
         StorageTransaction,
         WriteTransaction,
     },
     StorageAsRef,
-    StorageInspect,
-    StorageMutate,
 };
 
 use crate::{
     database::{
-        database_description::DatabaseDescription,
+        database_description::{
+            off_chain::OffChain,
+            on_chain::OnChain,
+        },
         genesis_progress::{
             GenesisMetadata,
             GenesisProgressMutate,
@@ -27,132 +30,122 @@ use crate::{
     },
 };
 
-use super::migration_name;
-
-pub struct ImportTask<Handler, Groups, DbDesc>
+pub trait ImportTable<T>
 where
-    DbDesc: DatabaseDescription,
+    T: TableWithBlueprint,
 {
-    handler: Handler,
-    skip: usize,
-    groups: Groups,
-    db: GenesisDatabase<DbDesc>,
-    reporter: ProgressReporter,
-}
-
-pub trait ImportTable {
-    type TableInSnapshot: TableWithBlueprint;
-    type TableBeingWritten: TableWithBlueprint;
-    type DbDesc: DatabaseDescription;
-
-    fn process(
+    fn on_chain(
         &mut self,
-        group: Vec<TableEntry<Self::TableInSnapshot>>,
-        tx: &mut StorageTransaction<&mut GenesisDatabase<Self::DbDesc>>,
-    ) -> anyhow::Result<()>;
-}
-
-impl<Logic, GroupGenerator, DbDesc> ImportTask<Logic, GroupGenerator, DbDesc>
-where
-    DbDesc: DatabaseDescription,
-    Logic: ImportTable<DbDesc = DbDesc>,
-    GenesisDatabase<DbDesc>: StorageInspect<GenesisMetadata<DbDesc>>,
-{
-    pub fn new(
-        handler: Logic,
-        groups: GroupGenerator,
-        db: GenesisDatabase<DbDesc>,
-        reporter: ProgressReporter,
-    ) -> Self {
-        let progress_name =
-            migration_name::<Logic::TableInSnapshot, Logic::TableBeingWritten>();
-        let skip = match db.storage::<GenesisMetadata<DbDesc>>().get(&progress_name) {
-            Ok(Some(idx_last_handled)) => {
-                usize::saturating_add(idx_last_handled.into_owned(), 1)
-            }
-            _ => 0,
-        };
-
-        Self {
-            handler,
-            skip,
-            groups,
-            db,
-            reporter,
-        }
-    }
-}
-
-impl<Logic, GroupGenerator, DbDesc> ImportTask<Logic, GroupGenerator, DbDesc>
-where
-    DbDesc: DatabaseDescription,
-    Logic: ImportTable<DbDesc = DbDesc>,
-    GroupGenerator:
-        IntoIterator<Item = anyhow::Result<Vec<TableEntry<Logic::TableInSnapshot>>>>,
-    GenesisMetadata<DbDesc>: TableWithBlueprint<
-        Column = DbDesc::Column,
-        Key = str,
-        Value = usize,
-        OwnedValue = usize,
-    >,
-    GenesisDatabase<DbDesc>:
-        StorageInspect<GenesisMetadata<DbDesc>> + WriteTransaction + Modifiable,
-    for<'a> StorageTransaction<&'a mut GenesisDatabase<DbDesc>>:
-        StorageMutate<GenesisMetadata<DbDesc>, Error = fuel_core_storage::Error>,
-{
-    pub fn run(mut self, cancel_token: CancellationToken) -> anyhow::Result<()> {
-        let mut db = self.db;
-        let mut is_cancelled = cancel_token.is_cancelled();
-        self.groups
-            .into_iter()
-            .enumerate()
-            .skip(self.skip)
-            .take_while(|_| {
-                is_cancelled = cancel_token.is_cancelled();
-                !is_cancelled
-            })
-            .try_for_each(|(index, group)| {
-                let group = group?;
-                let mut tx = db.write_transaction();
-                self.handler.process(group, &mut tx)?;
-
-                GenesisProgressMutate::<DbDesc>::update_genesis_progress(
-                    &mut tx,
-                    &migration_name::<Logic::TableInSnapshot, Logic::TableBeingWritten>(),
-                    index,
-                )?;
-                tx.commit()?;
-                self.reporter.set_index(index);
-                anyhow::Result::<_>::Ok(())
-            })?;
-
-        if is_cancelled {
-            bail!("Import cancelled")
-        }
-
+        _group: Cow<Vec<TableEntry<T>>>,
+        _tx: &mut StorageTransaction<&mut GenesisDatabase<OnChain>>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    fn off_chain(
+        &mut self,
+        _group: Cow<Vec<TableEntry<T>>>,
+        _tx: &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn import_entries<T>(
+    cancel_token: CancellationToken,
+    mut handler: impl ImportTable<T>,
+    groups: impl IntoIterator<Item = anyhow::Result<Vec<TableEntry<T>>>>,
+    mut on_chain_db: GenesisDatabase<OnChain>,
+    mut off_chain_db: GenesisDatabase<OffChain>,
+    reporter: ProgressReporter,
+) -> anyhow::Result<()>
+where
+    T: TableWithBlueprint,
+{
+    let on_chain_last_idx = on_chain_db
+        .storage::<GenesisMetadata<OnChain>>()
+        .get(T::column().name())?
+        .map(|x| x.into_owned());
+
+    let off_chain_last_idx = off_chain_db
+        .storage::<GenesisMetadata<OffChain>>()
+        .get(T::column().name())?
+        .map(|x| x.into_owned());
+
+    let num_groups_handled_by_all_dbs = on_chain_last_idx
+        .min(off_chain_last_idx)
+        .map(|x| x.saturating_add(1))
+        .unwrap_or(0);
+
+    for (index, group) in groups
+        .into_iter()
+        .enumerate()
+        .skip(num_groups_handled_by_all_dbs)
+    {
+        if cancel_token.is_cancelled() {
+            bail!("Import cancelled");
+        }
+        let group = group?;
+
+        if Some(index) > on_chain_last_idx {
+            let mut on_chain_tx = on_chain_db.write_transaction();
+            handler.on_chain(Cow::Borrowed(&group), &mut on_chain_tx)?;
+
+            GenesisProgressMutate::<OnChain>::update_genesis_progress(
+                &mut on_chain_tx,
+                T::column().name(),
+                index,
+            )?;
+            on_chain_tx.commit()?;
+        }
+
+        if Some(index) > off_chain_last_idx {
+            let mut off_chain_tx = off_chain_db.write_transaction();
+            handler.off_chain(Cow::Owned(group), &mut off_chain_tx)?;
+            GenesisProgressMutate::<OffChain>::update_genesis_progress(
+                &mut off_chain_tx,
+                T::column().name(),
+                index,
+            )?;
+            off_chain_tx.commit()?;
+        }
+
+        reporter.set_index(index);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         database::{
-            genesis_progress::GenesisProgressInspect,
+            database_description::{
+                off_chain::OffChain,
+                DatabaseDescription,
+            },
+            genesis_progress::{
+                GenesisMetadata,
+                GenesisProgressInspect,
+            },
             GenesisDatabase,
         },
+        graphql_api::storage::coins::{
+            OwnedCoinKey,
+            OwnedCoins,
+        },
         service::genesis::{
-            importer::{
-                import_task::ImportTask,
-                migration_name,
-            },
+            importer::import_task::import_entries,
             progress::ProgressReporter,
             task_manager::CancellationToken,
         },
     };
-    use std::sync::{
-        Arc,
-        Mutex,
+    use std::{
+        borrow::Cow,
+        sync::{
+            Arc,
+            Mutex,
+        },
     };
 
     use anyhow::{
@@ -160,11 +153,11 @@ mod tests {
         bail,
     };
     use fuel_core_chain_config::{
+        Groups,
         Randomize,
         TableEntry,
     };
     use fuel_core_storage::{
-        column::Column,
         iter::{
             BoxedIter,
             IterDirection,
@@ -173,8 +166,10 @@ mod tests {
         kv_store::{
             KVItem,
             KeyValueInspect,
+            StorageColumn,
             Value,
         },
+        structured_storage::TableWithBlueprint,
         tables::Coins,
         transactional::{
             Changes,
@@ -182,8 +177,8 @@ mod tests {
         },
         Result as StorageResult,
         StorageAsMut,
-        StorageAsRef,
         StorageInspect,
+        StorageMutate,
     };
     use fuel_core_types::{
         entities::coins::coin::{
@@ -191,7 +186,6 @@ mod tests {
             CompressedCoinV1,
         },
         fuel_tx::UtxoId,
-        fuel_types::BlockHeight,
     };
     use rand::{
         rngs::StdRng,
@@ -211,37 +205,115 @@ mod tests {
 
     use super::ImportTable;
 
-    struct TestHandler<L> {
-        logic: L,
+    #[derive(Default, Clone)]
+    struct ImporterSpy {
+        on_chain_called_with: Arc<Mutex<Vec<Vec<TableEntry<Coins>>>>>,
+        off_chain_called_with: Arc<Mutex<Vec<Vec<TableEntry<Coins>>>>>,
     }
 
-    impl<L> TestHandler<L>
-    where
-        TestHandler<L>: ImportTable,
-    {
-        pub fn new(logic: L) -> Self {
-            Self { logic }
+    impl ImporterSpy {
+        fn new() -> Self {
+            Self {
+                on_chain_called_with: Default::default(),
+                off_chain_called_with: Default::default(),
+            }
+        }
+
+        pub fn on_chain_called_with(&self) -> Vec<Vec<TableEntry<Coins>>> {
+            self.on_chain_called_with.lock().unwrap().clone()
+        }
+
+        pub fn off_chain_called_with(&self) -> Vec<Vec<TableEntry<Coins>>> {
+            self.off_chain_called_with.lock().unwrap().clone()
+        }
+
+        fn default_importer(&self) -> DefaultImporter {
+            TestTableImporter {
+                on_chain: |_, _| Ok(()),
+                off_chain: |_, _| Ok(()),
+                handler: self.clone(),
+            }
+        }
+
+        fn custom_importer<OnChainCallback, OffChainCallback>(
+            &self,
+            on_chain: OnChainCallback,
+            off_chain: OffChainCallback,
+        ) -> TestTableImporter<OnChainCallback, OffChainCallback>
+        where
+            OnChainCallback: FnMut(
+                Vec<TableEntry<Coins>>,
+                &mut StorageTransaction<&mut GenesisDatabase<OnChain>>,
+            ) -> anyhow::Result<()>,
+            OffChainCallback: FnMut(
+                Vec<TableEntry<Coins>>,
+                &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
+            ) -> anyhow::Result<()>,
+        {
+            TestTableImporter {
+                on_chain,
+                off_chain,
+                handler: self.clone(),
+            }
         }
     }
 
-    impl<L> ImportTable for TestHandler<L>
+    struct TestTableImporter<OnChainCallback, OffChainCallback> {
+        on_chain: OnChainCallback,
+        off_chain: OffChainCallback,
+        handler: ImporterSpy,
+    }
+    type DefaultImporter = TestTableImporter<
+        fn(
+            Vec<TableEntry<Coins>>,
+            &mut StorageTransaction<&mut GenesisDatabase<OnChain>>,
+        ) -> anyhow::Result<()>,
+        fn(
+            Vec<TableEntry<Coins>>,
+            &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
+        ) -> anyhow::Result<()>,
+    >;
+
+    impl<OnChainCallback, OffChainCallback> ImportTable<Coins>
+        for TestTableImporter<OnChainCallback, OffChainCallback>
     where
-        L: FnMut(
-            TableEntry<Coins>,
-            &mut StorageTransaction<&mut GenesisDatabase>,
+        OnChainCallback: FnMut(
+            Vec<TableEntry<Coins>>,
+            &mut StorageTransaction<&mut GenesisDatabase<OnChain>>,
+        ) -> anyhow::Result<()>,
+        OffChainCallback: FnMut(
+            Vec<TableEntry<Coins>>,
+            &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
         ) -> anyhow::Result<()>,
     {
-        type TableInSnapshot = Coins;
-        type TableBeingWritten = Coins;
-        type DbDesc = OnChain;
-        fn process(
+        fn on_chain(
             &mut self,
-            group: Vec<TableEntry<Self::TableInSnapshot>>,
-            tx: &mut StorageTransaction<&mut GenesisDatabase>,
+            group: Cow<Vec<TableEntry<Coins>>>,
+            tx: &mut StorageTransaction<&mut GenesisDatabase<OnChain>>,
         ) -> anyhow::Result<()> {
-            group
-                .into_iter()
-                .try_for_each(|item| (self.logic)(item, tx))
+            let group = group.into_owned();
+            self.handler
+                .on_chain_called_with
+                .lock()
+                .unwrap()
+                .push(group.clone());
+            (self.on_chain)(group, tx)?;
+            Ok(())
+        }
+
+        fn off_chain(
+            &mut self,
+            group: Cow<Vec<TableEntry<Coins>>>,
+            tx: &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
+        ) -> anyhow::Result<()> {
+            let group = group.into_owned();
+            self.handler
+                .off_chain_called_with
+                .lock()
+                .unwrap()
+                .push(group.clone());
+            (self.off_chain)(group, tx)?;
+            Ok(())
         }
     }
 
@@ -259,20 +331,21 @@ mod tests {
             Self { batches }
         }
 
-        pub fn as_entries(&self, skip_batches: usize) -> Vec<TableEntry<Coins>> {
-            self.batches
-                .iter()
-                .skip(skip_batches)
-                .flat_map(|batch| batch.clone())
+        pub fn as_unwrapped_groups(
+            &self,
+            skip_batches: usize,
+        ) -> Vec<Vec<TableEntry<Coins>>> {
+            self.batches.iter().skip(skip_batches).cloned().collect()
+        }
+
+        pub fn as_ok_groups(
+            &self,
+            skip_batches: usize,
+        ) -> Vec<anyhow::Result<Vec<TableEntry<Coins>>>> {
+            self.as_unwrapped_groups(skip_batches)
+                .into_iter()
+                .map(Ok)
                 .collect()
-        }
-
-        pub fn as_groups(&self) -> Vec<Vec<TableEntry<Coins>>> {
-            self.batches.clone()
-        }
-
-        pub fn as_ok_groups(&self) -> Vec<anyhow::Result<Vec<TableEntry<Coins>>>> {
-            self.as_groups().into_iter().map(Ok).collect()
         }
     }
 
@@ -281,22 +354,22 @@ mod tests {
         // given
         let data = TestData::new(3);
 
-        let mut called_with = vec![];
-        let runner = ImportTask::new(
-            TestHandler::new(|group, _| {
-                called_with.push(group);
-                Ok(())
-            }),
-            data.as_ok_groups(),
-            GenesisDatabase::default(),
-            ProgressReporter::default(),
-        );
+        let spy = ImporterSpy::default();
 
         // when
-        runner.run(never_cancel()).unwrap();
+        import_entries(
+            never_cancel(),
+            spy.default_importer(),
+            data.as_ok_groups(0),
+            GenesisDatabase::default(),
+            GenesisDatabase::default(),
+            ProgressReporter::default(),
+        )
+        .unwrap();
 
         // then
-        assert_eq!(called_with, data.as_entries(0));
+        assert_eq!(spy.on_chain_called_with(), data.as_unwrapped_groups(0));
+        assert_eq!(spy.off_chain_called_with(), data.as_unwrapped_groups(0));
     }
 
     #[test]
@@ -304,70 +377,36 @@ mod tests {
         // given
         let data = TestData::new(2);
 
-        let mut called_with = vec![];
-        let mut db = GenesisDatabase::<OnChain>::default();
+        let mut on_chain_db = GenesisDatabase::<OnChain>::default();
+        let mut off_chain_db = GenesisDatabase::<OffChain>::default();
+        let spy = ImporterSpy::new();
         GenesisProgressMutate::<OnChain>::update_genesis_progress(
-            &mut db,
-            &migration_name::<Coins, Coins>(),
+            &mut on_chain_db,
+            Coins::column().name(),
             0,
         )
         .unwrap();
-        let runner = ImportTask::new(
-            TestHandler::new(|element, _| {
-                called_with.push(element);
-                Ok(())
-            }),
-            data.as_ok_groups(),
-            db,
-            ProgressReporter::default(),
-        );
+        GenesisProgressMutate::<OffChain>::update_genesis_progress(
+            &mut off_chain_db,
+            Coins::column().name(),
+            0,
+        )
+        .unwrap();
 
         // when
-        runner.run(never_cancel()).unwrap();
-
-        // then
-        assert_eq!(called_with, data.as_entries(1));
-    }
-
-    #[test]
-    fn changes_to_db_by_handler_are_behind_a_transaction() {
-        // given
-        let groups = TestData::new(1);
-        let outer_db = GenesisDatabase::default();
-        let utxo_id = UtxoId::new(Default::default(), 0);
-
-        let runner = ImportTask::new(
-            TestHandler::new(|_, tx| {
-                insert_a_coin(tx, &utxo_id);
-
-                assert!(
-                    tx.storage::<Coins>().contains_key(&utxo_id).unwrap(),
-                    "Coin should be present in the tx db view"
-                );
-
-                assert!(
-                    !outer_db
-                        .storage_as_ref::<Coins>()
-                        .contains_key(&utxo_id)
-                        .unwrap(),
-                    "Coin should not be present in the outer db "
-                );
-
-                Ok(())
-            }),
-            groups.as_ok_groups(),
-            outer_db.clone(),
+        import_entries(
+            never_cancel(),
+            spy.default_importer(),
+            data.as_ok_groups(0),
+            on_chain_db.clone(),
+            off_chain_db.clone(),
             ProgressReporter::default(),
-        );
-
-        // when
-        runner.run(never_cancel()).unwrap();
+        )
+        .unwrap();
 
         // then
-        assert!(outer_db
-            .storage_as_ref::<Coins>()
-            .contains_key(&utxo_id)
-            .unwrap());
+        assert_eq!(spy.on_chain_called_with(), data.as_unwrapped_groups(1));
+        assert_eq!(spy.off_chain_called_with(), data.as_unwrapped_groups(1));
     }
 
     fn insert_a_coin(
@@ -379,61 +418,85 @@ mod tests {
         tx.storage_as_mut::<Coins>().insert(utxo_id, &coin).unwrap();
     }
 
-    #[test]
-    fn tx_reverted_if_handler_fails() {
-        // given
-        let groups = TestData::new(1);
-        let db = GenesisDatabase::default();
-        let utxo_id = UtxoId::new(Default::default(), 0);
-
-        let runner = ImportTask::new(
-            TestHandler::new(|_, tx| {
-                insert_a_coin(tx, &utxo_id);
-                bail!("Some error")
-            }),
-            groups.as_ok_groups(),
-            db.clone(),
-            ProgressReporter::default(),
-        );
-
-        // when
-        let _ = runner.run(never_cancel());
-
-        // then
-        assert!(!StorageInspect::<Coins>::contains_key(&db, &utxo_id).unwrap());
+    fn insert_an_owned_coin(
+        tx: &mut StorageTransaction<&mut GenesisDatabase<OffChain>>,
+        key: OwnedCoinKey,
+    ) {
+        tx.storage_as_mut::<OwnedCoins>().insert(&key, &()).unwrap();
     }
 
     #[test]
-    fn handler_failure_is_propagated() {
+    fn tx_reverted_if_on_chain_handler_fails() {
         // given
         let groups = TestData::new(1);
-        let runner = ImportTask::new(
-            TestHandler::new(|_, _| bail!("Some error")),
-            groups.as_ok_groups(),
-            Default::default(),
-            ProgressReporter::default(),
-        );
+        let on_chain_db = GenesisDatabase::default();
+        let utxo_id = UtxoId::new(Default::default(), 0);
 
         // when
-        let result = runner.run(never_cancel());
+        let _ = import_entries(
+            never_cancel(),
+            ImporterSpy::default().custom_importer(
+                move |_, tx| {
+                    insert_a_coin(tx, &utxo_id);
+                    bail!("Some error")
+                },
+                |_, _| Ok(()),
+            ),
+            groups.as_ok_groups(0),
+            on_chain_db.clone(),
+            GenesisDatabase::default(),
+            ProgressReporter::default(),
+        )
+        .expect_err("should fail");
 
         // then
-        assert!(result.is_err());
+        assert!(!StorageInspect::<Coins>::contains_key(&on_chain_db, &utxo_id).unwrap());
+    }
+
+    #[test]
+    fn tx_reverted_if_off_chain_handler_fails() {
+        // given
+        let groups = TestData::new(1);
+        let off_chain_db = GenesisDatabase::default();
+        let key = [0; std::mem::size_of::<OwnedCoinKey>()];
+
+        // when
+        let _ = import_entries(
+            never_cancel(),
+            ImporterSpy::default().custom_importer(
+                |_, _| Ok(()),
+                move |_, tx| {
+                    insert_an_owned_coin(tx, key);
+                    bail!("Some error")
+                },
+            ),
+            groups.as_ok_groups(0),
+            GenesisDatabase::default(),
+            off_chain_db.clone(),
+            ProgressReporter::default(),
+        )
+        .expect_err("should fail");
+
+        // then
+        assert!(
+            !StorageInspect::<OwnedCoins>::contains_key(&off_chain_db, &key).unwrap()
+        );
     }
 
     #[test]
     fn seeing_an_invalid_group_propagates_the_error() {
         // given
-        let groups = [Err(anyhow!("Some error"))];
-        let runner = ImportTask::new(
-            TestHandler::new(|_, _| Ok(())),
-            groups,
-            Default::default(),
-            ProgressReporter::default(),
-        );
+        let groups = Groups::new(vec![Err(anyhow!("Some error"))]);
 
         // when
-        let result = runner.run(never_cancel());
+        let result = import_entries(
+            never_cancel(),
+            ImporterSpy::default().default_importer(),
+            groups,
+            GenesisDatabase::default(),
+            GenesisDatabase::default(),
+            ProgressReporter::default(),
+        );
 
         // then
         assert!(result.is_err());
@@ -443,22 +506,32 @@ mod tests {
     fn successfully_processed_batch_updates_the_genesis_progress() {
         // given
         let data = TestData::new(2);
-        let db = GenesisDatabase::default();
-        let runner = ImportTask::new(
-            TestHandler::new(|_, _| Ok(())),
-            data.as_ok_groups(),
-            db.clone(),
-            ProgressReporter::default(),
-        );
+        let on_chain_db = GenesisDatabase::default();
+        let off_chain_db = GenesisDatabase::default();
 
         // when
-        runner.run(never_cancel()).unwrap();
+        import_entries(
+            never_cancel(),
+            ImporterSpy::default().default_importer(),
+            data.as_ok_groups(0),
+            on_chain_db.clone(),
+            off_chain_db.clone(),
+            ProgressReporter::default(),
+        )
+        .unwrap();
 
         // then
         assert_eq!(
             GenesisProgressInspect::<OnChain>::genesis_progress(
-                &db,
-                &migration_name::<Coins, Coins>(),
+                &on_chain_db,
+                Coins::column().name(),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            GenesisProgressInspect::<OffChain>::genesis_progress(
+                &off_chain_db,
+                Coins::column().name(),
             ),
             Some(1)
         );
@@ -469,38 +542,37 @@ mod tests {
         // given
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let read_groups = Arc::new(Mutex::new(vec![]));
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let runner = {
-            let read_groups = Arc::clone(&read_groups);
-            ImportTask::new(
-                TestHandler::new(move |el, _| {
-                    read_groups.lock().unwrap().push(el);
-                    Ok(())
-                }),
-                rx,
-                Default::default(),
-                ProgressReporter::default(),
-            )
+        let spy = ImporterSpy::default();
+        let runner_handle = {
+            let cancel_token = CancellationToken::new(cancel_token.clone());
+            let importer = spy.default_importer();
+            std::thread::spawn(move || {
+                import_entries(
+                    cancel_token,
+                    importer,
+                    rx,
+                    GenesisDatabase::default(),
+                    GenesisDatabase::default(),
+                    ProgressReporter::default(),
+                )
+            })
         };
-
-        let token = CancellationToken::new(cancel_token.clone());
-        let runner_handle = std::thread::spawn(move || runner.run(token));
 
         let data = TestData::new(4);
         let take = 3;
-        for group in data.as_ok_groups().into_iter().take(take) {
+        for group in data.as_ok_groups(0).into_iter().take(take) {
             tx.send(group).unwrap();
         }
 
-        while read_groups.lock().unwrap().len() < take {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        while spy.on_chain_called_with().len() < take {
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
         cancel_token.cancel();
 
         // when
-        tx.send(data.as_ok_groups().pop().unwrap()).unwrap();
+        tx.send(data.as_ok_groups(0).pop().unwrap()).unwrap();
 
         // then
         // runner should finish
@@ -508,40 +580,47 @@ mod tests {
         runner_handle
             .join()
             .unwrap()
-            .expect_err("Cancelling is an error");
+            .expect_err("Cancelling is a failure");
 
         // group after signal is not read
-        let read_entries = read_groups.lock().unwrap().clone();
-        let inserted_groups = data
-            .as_entries(0)
-            .into_iter()
-            .take(take)
-            .collect::<Vec<_>>();
-        assert_eq!(read_entries, inserted_groups);
+        let inserted_groups = &data.as_unwrapped_groups(0)[..take];
+        assert_eq!(spy.on_chain_called_with(), inserted_groups);
     }
 
     #[derive(Debug)]
-    struct BrokenTransactions {
-        store: MemoryStore,
+    struct BrokenTransactions<DbDesc>
+    where
+        DbDesc: DatabaseDescription,
+    {
+        store: MemoryStore<DbDesc>,
     }
 
-    impl BrokenTransactions {
-        fn new() -> Self {
+    impl<DbDesc> Default for BrokenTransactions<DbDesc>
+    where
+        DbDesc: DatabaseDescription,
+    {
+        fn default() -> Self {
             Self {
                 store: MemoryStore::default(),
             }
         }
     }
 
-    impl KeyValueInspect for BrokenTransactions {
-        type Column = Column;
+    impl<DbDesc> KeyValueInspect for BrokenTransactions<DbDesc>
+    where
+        DbDesc: DatabaseDescription,
+    {
+        type Column = DbDesc::Column;
 
-        fn get(&self, key: &[u8], column: Column) -> StorageResult<Option<Value>> {
+        fn get(&self, key: &[u8], column: Self::Column) -> StorageResult<Option<Value>> {
             self.store.get(key, column)
         }
     }
 
-    impl IterableStore for BrokenTransactions {
+    impl<DbDesc> IterableStore for BrokenTransactions<DbDesc>
+    where
+        DbDesc: DatabaseDescription,
+    {
         fn iter_store(
             &self,
             _: Self::Column,
@@ -553,32 +632,104 @@ mod tests {
         }
     }
 
-    impl TransactableStorage<BlockHeight> for BrokenTransactions {
+    impl<DbDesc> TransactableStorage<DbDesc::Height> for BrokenTransactions<DbDesc>
+    where
+        DbDesc: DatabaseDescription,
+    {
         fn commit_changes(
             &self,
-            _: Option<BlockHeight>,
+            _: Option<DbDesc::Height>,
             _: Changes,
         ) -> StorageResult<()> {
             Err(anyhow::anyhow!("I refuse to work!").into())
         }
     }
 
-    #[test]
-    fn tx_commit_failure_is_propagated() {
+    #[test_case::test_case(
+        GenesisDatabase::new(Arc::new(BrokenTransactions::<OnChain>::default())),
+        GenesisDatabase::default()
+    ; "broken on chain db")]
+    #[test_case::test_case(
+        GenesisDatabase::default(),
+        GenesisDatabase::new(Arc::new(BrokenTransactions::<OffChain>::default()))
+    ; "broken off chain db")]
+    fn on_chain_tx_commit_failure_is_propagated(
+        on_chain: GenesisDatabase<OnChain>,
+        off_chain: GenesisDatabase<OffChain>,
+    ) {
         // given
         let groups = TestData::new(1);
-        let runner = ImportTask::new(
-            TestHandler::new(|_, _| Ok(())),
-            groups.as_ok_groups(),
-            GenesisDatabase::new(Arc::new(BrokenTransactions::new())),
+
+        // TODO: check off chain as well
+        // when
+        let result = import_entries(
+            never_cancel(),
+            ImporterSpy::default().default_importer(),
+            groups.as_ok_groups(0),
+            on_chain,
+            off_chain,
             ProgressReporter::default(),
         );
 
-        // when
-        let result = runner.run(never_cancel());
-
         // then
         assert!(result.is_err());
+    }
+
+    #[test_case::test_case(None, Some(0) ; "on chain reverted at start")]
+    #[test_case::test_case(Some(0), None; "off chain reverted at start")]
+    #[test_case::test_case(Some(0), Some(1); "on chain reverted")]
+    #[test_case::test_case(Some(1), Some(0); "off chain reverted")]
+    #[test_case::test_case(Some(3), Some(1); "off chain reverted multiple times")]
+    #[test_case::test_case(Some(1), Some(3); "on chain reverted multiple times")]
+    fn can_recover_when_both_tx_dont_succeed_together(
+        last_on_chain: Option<usize>,
+        last_off_chain: Option<usize>,
+    ) {
+        // given
+        // Currently the difference is never going to be more than 1, but if we ever change that
+        // `import_entries` should be able to handle it.
+        let mut on_chain = GenesisDatabase::<OnChain>::default();
+        if let Some(last_on_chain_group_processed) = last_on_chain {
+            StorageMutate::<GenesisMetadata<OnChain>>::insert(
+                &mut on_chain,
+                "Coins",
+                &last_on_chain_group_processed,
+            )
+            .unwrap();
+        }
+
+        let mut off_chain = GenesisDatabase::<OffChain>::default();
+        if let Some(last_off_chain_group_processed) = last_off_chain {
+            StorageMutate::<GenesisMetadata<OffChain>>::insert(
+                &mut off_chain,
+                "Coins",
+                &last_off_chain_group_processed,
+            )
+            .unwrap();
+        }
+
+        let spy = ImporterSpy::default();
+        let groups = TestData::new(5);
+
+        // when
+        import_entries(
+            never_cancel(),
+            spy.default_importer(),
+            groups.as_ok_groups(0),
+            on_chain,
+            off_chain,
+            ProgressReporter::default(),
+        )
+        .unwrap();
+
+        // then
+        let on_chain_imports = spy.on_chain_called_with();
+        let skip = last_on_chain.map(|x| x.saturating_add(1)).unwrap_or(0);
+        assert_eq!(on_chain_imports, groups.as_unwrapped_groups(skip));
+
+        let off_chain_imports = spy.off_chain_called_with();
+        let skip = last_off_chain.map(|x| x.saturating_add(1)).unwrap_or(0);
+        assert_eq!(off_chain_imports, groups.as_unwrapped_groups(skip));
     }
 
     fn never_cancel() -> CancellationToken {
