@@ -76,7 +76,7 @@ use crate::state::{
 };
 #[cfg(feature = "rocksdb")]
 use std::path::Path;
-use fuel_core_gas_price_service::fuel_gas_price_updater::fuel_core_storage_adapter::storage::{ GasPriceMetadata};
+use fuel_core_gas_price_service::fuel_gas_price_updater::fuel_core_storage_adapter::storage::GasPriceMetadata;
 use crate::database::database_description::gas_price::GasPriceDatabase;
 
 // Storages implementation
@@ -121,7 +121,7 @@ pub type Database<Description = OnChain, Stage = RegularStage<Description>> =
     GenericDatabase<DataSource<Description, Stage>>;
 pub type OnChainIterableKeyValueView = IterableKeyValueView<ColumnType<OnChain>>;
 pub type OffChainIterableKeyValueView = IterableKeyValueView<ColumnType<OffChain>>;
-pub type ReyalerIterableKeyValueView = IterableKeyValueView<ColumnType<Relayer>>;
+pub type RelayerIterableKeyValueView = IterableKeyValueView<ColumnType<Relayer>>;
 
 pub type GenesisDatabase<Description = OnChain> = Database<Description, GenesisStage>;
 

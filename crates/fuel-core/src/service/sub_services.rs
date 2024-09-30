@@ -40,6 +40,7 @@ use crate::{
 };
 #[allow(unused_imports)]
 use fuel_core_gas_price_service::fuel_gas_price_updater::{
+    algorithm_updater,
     fuel_core_storage_adapter::FuelL2BlockSource,
     Algorithm,
     AlgorithmV0,
@@ -64,8 +65,6 @@ use fuel_core_types::blockchain::primitives::DaBlockHeight;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-mod algorithm_updater;
-
 pub type PoAService = fuel_core_poa::Service<
     TxPoolAdapter,
     BlockProducerAdapter,
@@ -75,7 +74,7 @@ pub type PoAService = fuel_core_poa::Service<
     SystemTime,
 >;
 #[cfg(feature = "p2p")]
-pub type P2PService = fuel_core_p2p::service::Service<Database>;
+pub type P2PService = fuel_core_p2p::service::Service<Database, TxPoolAdapter>;
 pub type TxPoolSharedState = fuel_core_txpool::service::SharedState<
     P2PAdapter,
     Database,
@@ -169,14 +168,10 @@ pub fn init_sub_services(
     };
 
     #[cfg(feature = "p2p")]
-    let mut network = config.p2p.clone().map(|p2p_config| {
-        fuel_core_p2p::service::new_service(
-            chain_id,
-            p2p_config,
-            database.on_chain().clone(),
-            importer_adapter.clone(),
-        )
-    });
+    let p2p_externals = config
+        .p2p
+        .clone()
+        .map(fuel_core_p2p::service::build_shared_state);
 
     #[cfg(feature = "p2p")]
     let p2p_adapter = {
@@ -192,7 +187,7 @@ pub fn init_sub_services(
             invalid_transactions: -100.,
         };
         P2PAdapter::new(
-            network.as_ref().map(|network| network.shared.clone()),
+            p2p_externals.as_ref().map(|ext| ext.0.clone()),
             peer_report_config,
         )
     };
@@ -205,7 +200,7 @@ pub fn init_sub_services(
     let block_stream = importer_adapter.events_shared_result();
 
     let gas_price_init = algorithm_updater::InitializeTask::new(
-        config.clone(),
+        config.clone().into(),
         genesis_block_height,
         settings,
         block_stream,
@@ -228,6 +223,21 @@ pub fn init_sub_services(
         SharedMemoryPool::new(config.memory_pool_size),
     );
     let tx_pool_adapter = TxPoolAdapter::new(txpool.shared.clone());
+
+    #[cfg(feature = "p2p")]
+    let mut network = config.p2p.clone().zip(p2p_externals).map(
+        |(p2p_config, (shared_state, request_receiver))| {
+            fuel_core_p2p::service::new_service(
+                chain_id,
+                p2p_config,
+                shared_state,
+                request_receiver,
+                database.on_chain().clone(),
+                importer_adapter.clone(),
+                tx_pool_adapter.clone(),
+            )
+        },
+    );
 
     let block_producer = fuel_core_producer::Producer {
         config: config.block_producer.clone(),
