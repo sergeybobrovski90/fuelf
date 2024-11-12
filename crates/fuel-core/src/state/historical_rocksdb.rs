@@ -25,6 +25,7 @@ use crate::{
         TransactableStorage,
     },
 };
+use core::fmt;
 use fuel_core_storage::{
     iter::{
         BoxedIter,
@@ -55,6 +56,8 @@ use modifications_history::{
     ModificationsHistoryV1,
     ModificationsHistoryV2,
 };
+use modifications_history_migration::MigrationState;
+use parking_lot::RwLock;
 use serde::{
     Deserialize,
     Serialize,
@@ -62,10 +65,13 @@ use serde::{
 use std::{
     num::NonZeroU64,
     path::Path,
+    sync::Arc,
+    thread,
 };
 
 pub mod description;
 pub mod modifications_history;
+pub mod modifications_history_migration;
 pub mod view_at_height;
 
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
@@ -81,26 +87,298 @@ pub enum StateRewindPolicy {
     RewindRange { size: NonZeroU64 },
 }
 
-/// Implementation of a database
+/// A structure representing a historical RocksDB.
+/// The HistoricalRocksDB augments the RocksDB with
+/// the ability to store the modification history of changes
+/// made when creating a new view. This is used to rollback the database to
+/// a previous state.
+/// Each HistoricalRocksDB specifies a [StateRewindPolicy] that determines
+/// the retention policy of the modification history.
 #[derive(Debug)]
-pub struct HistoricalRocksDB<Description> {
-    /// The [`StateRewindPolicy`] used by the historical rocksdb
-    state_rewind_policy: StateRewindPolicy,
-    /// The Description of the database.
-    db: RocksDb<Historical<Description>>,
+pub struct HistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    inner: Arc<InnerHistoricalRocksDB<Description>>,
 }
 
 impl<Description> HistoricalRocksDB<Description>
 where
     Description: DatabaseDescription,
 {
+    /// Creates a HistoricalRocksDB instance from an existing RocksDB instance.
+    /// Upon invoking this function, a separate thread will be spawned to migrate
+    /// the modification history from V1 to V2.
     pub fn new(
         db: RocksDb<Historical<Description>>,
         state_rewind_policy: StateRewindPolicy,
     ) -> DatabaseResult<Self> {
+        let v1_changes_to_migrate_at_once = 1000;
+        let shared_migration_state = Arc::new(RwLock::new(MigrationState::default()));
+        let inner = Arc::new(InnerHistoricalRocksDB::new(
+            db,
+            state_rewind_policy,
+            shared_migration_state,
+        )?);
+        Self::migrate_modifications_history(inner.clone(), v1_changes_to_migrate_at_once);
+        Ok(Self { inner })
+    }
+
+    /// Opens a HistoricalRocksDB instance from the given path.
+    /// Upon invoking this function, a separate thread will be spawned to migrate
+    /// the modification history from V1 to V2.
+    pub fn default_open<P: AsRef<Path>>(
+        path: P,
+        capacity: Option<usize>,
+        state_rewind_policy: StateRewindPolicy,
+        max_fds: i32,
+    ) -> DatabaseResult<Self> {
+        let v1_changes_to_migrate_at_once = 1000;
+        let shared_migration_state = Arc::new(RwLock::new(MigrationState::default()));
+        let inner = Arc::new(InnerHistoricalRocksDB::default_open(
+            path,
+            capacity,
+            state_rewind_policy,
+            max_fds,
+            shared_migration_state,
+        )?);
+        Self::migrate_modifications_history(inner.clone(), v1_changes_to_migrate_at_once);
+        Ok(Self { inner })
+    }
+
+    fn migrate_modifications_history(
+        historical_rocksdb: Arc<InnerHistoricalRocksDB<Description>>,
+        num_heights_to_migrate_at_once: usize,
+    ) {
+        let last_migratable_height = historical_rocksdb
+            .db
+            .iter_all_keys::<ModificationsHistoryV1<Description>>(None)
+            .filter_map(Result::ok) //TODO: How to handle errors here? Should we stop the migration?
+            .max();
+        let Some(last_migratable_height) = last_migratable_height else {
+            historical_rocksdb
+                .shared_migration_state
+                .write()
+                .complete_migration();
+            return
+        };
+
+        thread::spawn(move || {
+            historical_rocksdb
+                .shared_migration_state
+                .write()
+                .update_last_height_to_be_migrated(last_migratable_height);
+
+            let mut v1_modifications_iterator = historical_rocksdb
+                .db
+                .iter_all_keys::<ModificationsHistoryV1<Description>>(None)
+                .chunks(num_heights_to_migrate_at_once);
+
+            loop {
+                let mut should_continue = false;
+                for v1_modifications in &v1_modifications_iterator {
+                    // We processed at least a V1 modification, so we should continue with the migration
+                    should_continue = true;
+                    let mut storage_transaction =
+                        historical_rocksdb.db.read_transaction();
+                    for height in v1_modifications {
+                        let Ok(height) = height else {
+                            // We can continue with migrating other keys
+                            continue;
+                        };
+
+                        let Ok(Some(v1_changes)) = storage_transaction
+                            .storage_as_mut::<ModificationsHistoryV1<Description>>()
+                            .take(&height)
+                        else {
+                            continue
+                        };
+
+                        storage_transaction
+                            .storage_as_mut::<ModificationsHistoryV2<Description>>()
+                            .insert(&height, &v1_changes)
+                            .expect("Insertion on a in-memory transaction cannot fail");
+                    }
+                    historical_rocksdb
+                        .shared_migration_state
+                        .write()
+                        .add_migration_changes(storage_transaction.into_changes());
+                }
+                if should_continue {
+                    v1_modifications_iterator = historical_rocksdb
+                        .db
+                        .iter_all_keys::<ModificationsHistoryV1<Description>>(None)
+                        .chunks(num_heights_to_migrate_at_once);
+                } else {
+                    break
+                }
+            }
+
+            historical_rocksdb
+                .shared_migration_state
+                .write()
+                .complete_migration();
+        });
+    }
+
+    /// Returns the latest view of the database.
+    pub fn latest_view(&self) -> RocksDb<Description> {
+        self.inner.latest_view()
+    }
+
+    /// Creates a view at the given height.
+    pub fn create_view_at(
+        &self,
+        height: &Description::Height,
+    ) -> StorageResult<ViewAtHeight<Description>> {
+        self.inner.create_view_at(height)
+    }
+}
+
+impl<Description> TryFrom<InnerHistoricalRocksDB<Description>>
+    for HistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    type Error = DatabaseError;
+
+    fn try_from(inner: InnerHistoricalRocksDB<Description>) -> DatabaseResult<Self> {
+        let InnerHistoricalRocksDB {
+            db,
+            state_rewind_policy,
+            ..
+        } = inner;
+        Self::new(db, state_rewind_policy)
+    }
+}
+
+impl<Description> KeyValueInspect for HistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    type Column = Description::Column;
+
+    fn exists(&self, key: &[u8], column: Self::Column) -> StorageResult<bool> {
+        self.inner.exists(key, column)
+    }
+
+    fn size_of_value(
+        &self,
+        key: &[u8],
+        column: Self::Column,
+    ) -> StorageResult<Option<usize>> {
+        self.inner.size_of_value(key, column)
+    }
+
+    fn get(&self, key: &[u8], column: Self::Column) -> StorageResult<Option<Value>> {
+        self.inner.get(key, column)
+    }
+
+    fn read(
+        &self,
+        key: &[u8],
+        column: Self::Column,
+        buf: &mut [u8],
+    ) -> StorageResult<Option<usize>> {
+        self.inner.read(key, column, buf)
+    }
+}
+
+impl<Description> IterableStore for HistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    fn iter_store(
+        &self,
+        column: Self::Column,
+        prefix: Option<&[u8]>,
+        start: Option<&[u8]>,
+        direction: IterDirection,
+    ) -> BoxedIter<KVItem> {
+        self.inner.iter_store(column, prefix, start, direction)
+    }
+
+    fn iter_store_keys(
+        &self,
+        column: Self::Column,
+        prefix: Option<&[u8]>,
+        start: Option<&[u8]>,
+        direction: IterDirection,
+    ) -> BoxedIter<fuel_core_storage::kv_store::KeyItem> {
+        self.inner.iter_store_keys(column, prefix, start, direction)
+    }
+}
+
+impl<Description> TransactableStorage<Description::Height>
+    for HistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    fn commit_changes(
+        &self,
+        height: Option<Description::Height>,
+        changes: Changes,
+    ) -> StorageResult<()> {
+        self.inner.commit_changes(height, changes)
+    }
+
+    fn view_at_height(
+        &self,
+        height: &Description::Height,
+    ) -> StorageResult<KeyValueView<ColumnType<Description>>> {
+        self.inner.view_at_height(height)
+    }
+
+    fn latest_view(
+        &self,
+    ) -> StorageResult<IterableKeyValueView<ColumnType<Description>>> {
+        <InnerHistoricalRocksDB<Description> as TransactableStorage<
+            Description::Height,
+        >>::latest_view(&*self.inner)
+    }
+
+    fn rollback_block_to(&self, height: &Description::Height) -> StorageResult<()> {
+        <InnerHistoricalRocksDB<Description> as TransactableStorage<
+            Description::Height,
+        >>::rollback_block_to(&*self.inner, height)
+    }
+}
+
+/// Implementation of a database
+pub struct InnerHistoricalRocksDB<Description> {
+    /// The [`StateRewindPolicy`] used by the historical rocksdb
+    state_rewind_policy: StateRewindPolicy,
+    /// The Description of the database.
+    db: RocksDb<Historical<Description>>,
+    /// The migration state for the modification history, shared among all instances of the database
+    shared_migration_state: Arc<RwLock<MigrationState<Description>>>,
+}
+
+impl<Description> fmt::Debug for InnerHistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InnerHistoricalRocksDB")
+            .field("state_rewind_policy", &self.state_rewind_policy)
+            .field("db", &self.db)
+            .finish()
+    }
+}
+
+impl<Description> InnerHistoricalRocksDB<Description>
+where
+    Description: DatabaseDescription,
+{
+    pub fn new(
+        db: RocksDb<Historical<Description>>,
+        state_rewind_policy: StateRewindPolicy,
+        shared_migration_state: Arc<RwLock<MigrationState<Description>>>,
+    ) -> DatabaseResult<Self> {
         Ok(Self {
             state_rewind_policy,
             db,
+            shared_migration_state,
         })
     }
 
@@ -109,12 +387,14 @@ where
         capacity: Option<usize>,
         state_rewind_policy: StateRewindPolicy,
         max_fds: i32,
+        shared_migration_state: Arc<RwLock<MigrationState<Description>>>,
     ) -> DatabaseResult<Self> {
         let db =
             RocksDb::<Historical<Description>>::default_open(path, capacity, max_fds)?;
         Ok(Self {
             state_rewind_policy,
             db,
+            shared_migration_state,
         })
     }
 
@@ -198,7 +478,10 @@ where
     where
         T: KeyValueInspect<Column = Column<Description>>,
     {
-        let modifications_history_migration_in_progress = self.is_migration_in_progress();
+        let modifications_history_migration_in_progress = self
+            .shared_migration_state
+            .read()
+            .is_migration_in_progress();
 
         if self.state_rewind_policy == StateRewindPolicy::NoRewind {
             return Ok(());
@@ -292,7 +575,10 @@ where
     }
 
     fn oldest_changes_height(&self) -> StorageResult<Option<u64>> {
-        let modifications_history_migration_in_progress = self.is_migration_in_progress();
+        let modifications_history_migration_in_progress = self
+            .shared_migration_state
+            .read()
+            .is_migration_in_progress();
 
         let (v2_oldest_height, v1_oldest_height) = self.multiversion_changes_heights(
             IterDirection::Forward,
@@ -314,7 +600,10 @@ where
     // TODO: This method doesn't work properly because of
     //  https://github.com/FuelLabs/fuel-core/issues/2095
     fn rollback_last_block(&self) -> StorageResult<u64> {
-        let modifications_history_migration_in_progress = self.is_migration_in_progress();
+        let modifications_history_migration_in_progress = self
+            .shared_migration_state
+            .read()
+            .is_migration_in_progress();
 
         let (v2_latest_height, v1_latest_height) = self.multiversion_changes_heights(
             IterDirection::Reverse,
@@ -343,7 +632,9 @@ where
         let last_changes = multiversion_take(
             &mut storage_transaction,
             height_to_rollback,
-            self.is_migration_in_progress(),
+            self.shared_migration_state
+                .read()
+                .is_migration_in_progress(),
         )?
         .ok_or(not_found!(ModificationsHistoryV1<Description>))?;
 
@@ -360,19 +651,17 @@ where
         )
         .commit()?;
 
+        // Reduce the latest migratable height before the rollback. This is necessary to avoid
+        // concurrency race condition where stale changes for the level being rollbacked are
+        // committed before the latest migratable height is reduced.
+        self.shared_migration_state
+            .write()
+            .update_last_height_to_be_migrated(height_to_rollback);
+
         self.db
             .commit_changes(&storage_transaction.into_changes())?;
 
         Ok(())
-    }
-
-    fn v1_entries(&self) -> BoxedIter<StorageResult<(u64, Changes)>> {
-        self.db
-            .iter_all::<ModificationsHistoryV1<Description>>(None)
-    }
-
-    fn is_migration_in_progress(&self) -> bool {
-        self.v1_entries().next().is_some()
     }
 }
 
@@ -515,7 +804,7 @@ where
     Ok(())
 }
 
-impl<Description> KeyValueInspect for HistoricalRocksDB<Description>
+impl<Description> KeyValueInspect for InnerHistoricalRocksDB<Description>
 where
     Description: DatabaseDescription,
 {
@@ -547,7 +836,7 @@ where
     }
 }
 
-impl<Description> IterableStore for HistoricalRocksDB<Description>
+impl<Description> IterableStore for InnerHistoricalRocksDB<Description>
 where
     Description: DatabaseDescription,
 {
@@ -575,7 +864,7 @@ where
 }
 
 impl<Description> TransactableStorage<Description::Height>
-    for HistoricalRocksDB<Description>
+    for InnerHistoricalRocksDB<Description>
 where
     Description: DatabaseDescription,
 {
@@ -588,15 +877,36 @@ where
         // If the migration is not in progress, the default set of changes will be used, and the overhead
         // for handling caused by this function to handle the migration will be minimal.
 
-        let mut storage_transaction =
-            StorageTransaction::transaction(&self.db, ConflictPolicy::Overwrite, changes);
+        // Non-empty changes will be returned only when the migration is in progress.
+        // Changes returend are guaranteed to be non-stale.
+        let migration_changes = self
+            .shared_migration_state
+            .write()
+            .take_migration_changes()
+            .unwrap_or_default();
+
+        let migration_changes_transaction = StorageTransaction::transaction(
+            &self.db,
+            ConflictPolicy::Overwrite,
+            migration_changes,
+        );
+
+        let mut storage_transaction = StorageTransaction::transaction(
+            migration_changes_transaction,
+            ConflictPolicy::Overwrite,
+            changes,
+        );
 
         if let Some(height) = height {
             self.store_modifications_history(&mut storage_transaction, &height)?;
         }
 
-        self.db
-            .commit_changes(&storage_transaction.into_changes())?;
+        let transaction_with_commit_and_migration_changes =
+            storage_transaction.commit()?;
+
+        self.db.commit_changes(
+            &transaction_with_commit_and_migration_changes.into_changes(),
+        )?;
 
         Ok(())
     }
@@ -680,8 +990,12 @@ mod tests {
     fn historical_rocksdb_read_original_database_works() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db =
-            HistoricalRocksDB::new(rocks_db, StateRewindPolicy::RewindFullRange).unwrap();
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
+            rocks_db,
+            StateRewindPolicy::RewindFullRange,
+            Arc::new(RwLock::new(MigrationState::default())),
+        )
+        .unwrap();
 
         // Set the value at height 1 to be 123.
         let mut transaction = historical_rocks_db.read_transaction();
@@ -720,8 +1034,12 @@ mod tests {
     fn historical_rocksdb_read_latest_view_works() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db =
-            HistoricalRocksDB::new(rocks_db, StateRewindPolicy::RewindFullRange).unwrap();
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
+            rocks_db,
+            StateRewindPolicy::RewindFullRange,
+            Arc::new(RwLock::new(MigrationState::default())),
+        )
+        .unwrap();
 
         // Set the value at height 1 to be 123.
         let mut transaction = historical_rocks_db.read_transaction();
@@ -760,8 +1078,12 @@ mod tests {
     fn state_rewind_policy__no_rewind__create_view_at__fails() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db =
-            HistoricalRocksDB::new(rocks_db, StateRewindPolicy::NoRewind).unwrap();
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
+            rocks_db,
+            StateRewindPolicy::NoRewind,
+            Arc::new(RwLock::new(MigrationState::default())),
+        )
+        .unwrap();
 
         let mut transaction = historical_rocks_db.read_transaction();
         transaction
@@ -787,8 +1109,12 @@ mod tests {
     fn state_rewind_policy__no_rewind__rollback__fails() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db =
-            HistoricalRocksDB::new(rocks_db, StateRewindPolicy::NoRewind).unwrap();
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
+            rocks_db,
+            StateRewindPolicy::NoRewind,
+            Arc::new(RwLock::new(MigrationState::default())),
+        )
+        .unwrap();
 
         let mut transaction = historical_rocks_db.read_transaction();
         transaction
@@ -810,11 +1136,12 @@ mod tests {
     fn state_rewind_policy__rewind_range_1__cleanup_in_range_works() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(1).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
@@ -857,11 +1184,12 @@ mod tests {
     fn state_rewind_policy__rewind_range_1__rollback_works() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(1).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
@@ -895,11 +1223,12 @@ mod tests {
     fn state_rewind_policy__rewind_range_1__rollback_uses_v2() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(1).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
@@ -930,11 +1259,12 @@ mod tests {
     fn state_rewind_policy__rewind_range_1__rollback_during_migration_works() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(1).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
@@ -1005,8 +1335,12 @@ mod tests {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
 
-        let historical_rocks_db =
-            HistoricalRocksDB::new(rocks_db, StateRewindPolicy::RewindFullRange).unwrap();
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
+            rocks_db,
+            StateRewindPolicy::RewindFullRange,
+            Arc::new(RwLock::new(MigrationState::default())),
+        )
+        .unwrap();
 
         // When
         // Commit 1000 blocks
@@ -1037,11 +1371,12 @@ mod tests {
     fn state_rewind_policy__rewind_range_1__second_rollback_fails() {
         // Given
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(1).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
@@ -1067,11 +1402,12 @@ mod tests {
         const ITERATIONS: usize = 100;
 
         let rocks_db = RocksDb::<Historical<OnChain>>::default_open_temp(None).unwrap();
-        let historical_rocks_db = HistoricalRocksDB::new(
+        let historical_rocks_db = InnerHistoricalRocksDB::new(
             rocks_db,
             StateRewindPolicy::RewindRange {
                 size: NonZeroU64::new(ITERATIONS as u64).unwrap(),
             },
+            Arc::new(RwLock::new(MigrationState::default())),
         )
         .unwrap();
 
