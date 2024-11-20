@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 
 ### Fixed
+- [2375](https://github.com/FuelLabs/fuel-core/pull/2375): Modify executor to ignore messages from the relayer that have a duplicate nonce
 - [2366](https://github.com/FuelLabs/fuel-core/pull/2366): The `importer_gas_price_for_block` metric is properly collected.
 - [2369](https://github.com/FuelLabs/fuel-core/pull/2369): The `transaction_insertion_time_in_thread_pool_milliseconds` metric is properly collected.
 - [2413](https://github.com/FuelLabs/fuel-core/issues/2413): block production immediately errors if unable to lock the mutex.
@@ -43,6 +44,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 #### Breaking
 - [2154](https://github.com/FuelLabs/fuel-core/pull/2154): Transaction graphql endpoints use `TransactionType` instead of `fuel_tx::Transaction`.
+
+### Breaking
+- [](https://github.com/FuelLabs/fuel-core/pull/2375): Add new `ExecutorEvent` variant for ignored messages
 
 ## [Version 0.40.0]
 

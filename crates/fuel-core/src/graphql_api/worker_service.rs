@@ -201,6 +201,7 @@ where
                         &(),
                     )?;
             }
+            Event::MessageIgnored { .. } => {}
             Event::MessageConsumed(message) => {
                 block_st_transaction
                     .storage_as_mut::<OwnedMessageIds>()
