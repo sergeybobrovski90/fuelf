@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::{
     database::{
         database_description::{
@@ -25,8 +23,6 @@ use crate::{
         balances::{
             CoinBalances,
             CoinBalancesKey,
-            MessageBalance,
-            MessageBalances,
             TotalBalanceAmount,
         },
         old::{
@@ -80,7 +76,6 @@ use fuel_core_types::{
     },
     services::txpool::TransactionStatus,
 };
-use tracing::debug;
 
 impl OffChainDatabase for OffChainIterableKeyValueView {
     fn block_height(&self, id: &BlockId) -> StorageResult<BlockHeight> {
@@ -208,7 +203,6 @@ impl OffChainDatabase for OffChainIterableKeyValueView {
         &self,
         owner: &Address,
         asset_id: &AssetId,
-        base_asset_id: &AssetId,
     ) -> StorageResult<TotalBalanceAmount> {
         let coins = self
             .storage_as_ref::<CoinBalances>()
@@ -216,61 +210,29 @@ impl OffChainDatabase for OffChainIterableKeyValueView {
             .unwrap_or_default()
             .into_owned() as TotalBalanceAmount;
 
-        if base_asset_id == asset_id {
-            let MessageBalance {
-                retryable: _, // TODO[RC]: Handle this
-                non_retryable,
-            } = self
-                .storage_as_ref::<MessageBalances>()
-                .get(owner)?
-                .unwrap_or_default()
-                .into_owned();
-
-            let total = coins.checked_add(non_retryable).ok_or(anyhow::anyhow!(
-                "Total balance overflow: coins: {coins}, messages: {non_retryable}"
-            ))?;
-
-            debug!(%coins, %non_retryable, total, "total balance");
-            Ok(total)
-        } else {
-            debug!(%coins, "total balance");
-            Ok(coins)
-        }
+        Ok(coins)
     }
 
     fn balances(
         &self,
         owner: &Address,
-        base_asset_id: &AssetId,
-    ) -> StorageResult<BTreeMap<AssetId, TotalBalanceAmount>> {
-        let mut balances = BTreeMap::new();
-        for balance_key in self.iter_all_by_prefix_keys::<CoinBalances, _>(Some(owner)) {
-            let key = balance_key?;
-            let asset_id = key.asset_id();
-
-            let coins = self
-                .storage_as_ref::<CoinBalances>()
-                .get(&key)?
-                .unwrap_or_default()
-                .into_owned() as TotalBalanceAmount;
-
-            balances.insert(*asset_id, coins);
-        }
-
-        if let Some(messages) = self.storage_as_ref::<MessageBalances>().get(owner)? {
-            let MessageBalance {
-                retryable: _,
-                non_retryable,
-            } = *messages;
-            balances
-                .entry(*base_asset_id)
-                .and_modify(|current| {
-                    *current = current.saturating_add(non_retryable);
+        direction: IterDirection,
+    ) -> BoxedIter<'_, StorageResult<(AssetId, TotalBalanceAmount)>> {
+        let balances_iter = self
+            .iter_all_filtered_keys::<CoinBalances, _>(Some(owner), None, Some(direction))
+            .map(move |result| {
+                result.and_then(|key| {
+                    let asset_id = key.asset_id();
+                    let coin_balance =
+                        self.storage_as_ref::<CoinBalances>()
+                            .get(&key)?
+                            .unwrap_or_default()
+                            .into_owned() as TotalBalanceAmount;
+                    Ok((*asset_id, coin_balance))
                 })
-                .or_insert(non_retryable);
-        }
+            });
 
-        Ok(balances)
+        balances_iter.into_boxed()
     }
 }
 

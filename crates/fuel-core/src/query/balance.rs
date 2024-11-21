@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    future,
 };
 
 use crate::{
@@ -48,7 +47,7 @@ impl ReadView {
     ) -> StorageResult<AddressBalance> {
         let amount = if self.balances_enabled {
             debug!(%owner, %asset_id, "Querying balance with balances cache");
-            self.off_chain.balance(&owner, &asset_id, &base_asset_id)?
+            self.off_chain.balance(&owner, &asset_id)?
         } else {
             debug!(%owner, %asset_id, "Querying balance without balances cache");
             AssetQuery::new(
@@ -87,11 +86,7 @@ impl ReadView {
         base_asset_id: &'a AssetId,
     ) -> impl Stream<Item = StorageResult<AddressBalance>> + 'a {
         if self.balances_enabled {
-            futures::future::Either::Left(self.balances_with_cache(
-                owner,
-                base_asset_id,
-                direction,
-            ))
+            futures::future::Either::Left(self.balances_with_cache(owner, direction))
         } else {
             futures::future::Either::Right(self.balances_without_cache(
                 owner,
@@ -165,28 +160,18 @@ impl ReadView {
     fn balances_with_cache<'a>(
         &'a self,
         owner: &'a Address,
-        base_asset_id: &AssetId,
         direction: IterDirection,
     ) -> impl Stream<Item = StorageResult<AddressBalance>> + 'a {
         debug!(%owner, "Querying balances using balances cache");
-        match self.off_chain.balances(owner, base_asset_id) {
-            Ok(balances) => {
-                let iter = if direction == IterDirection::Reverse {
-                    itertools::Either::Left(balances.into_iter().rev())
-                } else {
-                    itertools::Either::Right(balances.into_iter())
-                };
-                stream::iter(iter.map(|(asset_id, amount)| AddressBalance {
+
+        stream::iter(self.off_chain.balances(owner, direction))
+            .map(move |result| {
+                result.map(|(asset_id, amount)| AddressBalance {
                     owner: *owner,
-                    amount,
                     asset_id,
-                }))
-                .map(Ok)
-                .into_stream()
-                .yield_each(self.batch_size)
-                .left_stream()
-            }
-            Err(err) => stream::once(future::ready(Err(err))).right_stream(),
-        }
+                    amount,
+                })
+            })
+            .yield_each(self.batch_size)
     }
 }

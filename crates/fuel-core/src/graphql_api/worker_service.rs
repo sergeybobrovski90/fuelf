@@ -65,6 +65,7 @@ use fuel_core_types::{
             CoinPredicate,
             CoinSigned,
         },
+        AssetId,
         Contract,
         Input,
         Output,
@@ -121,6 +122,7 @@ pub struct InitializeTask<TxPool, BlockImporter, OnChain, OffChain> {
     block_importer: BlockImporter,
     on_chain_database: OnChain,
     off_chain_database: OffChain,
+    base_asset_id: AssetId,
 }
 
 /// The off-chain GraphQL API worker task processes the imported blocks
@@ -133,6 +135,7 @@ pub struct Task<TxPool, D> {
     da_compression_config: DaCompressionConfig,
     continue_on_error: bool,
     balances_enabled: bool,
+    base_asset_id: AssetId,
 }
 
 impl<TxPool, D> Task<TxPool, D>
@@ -166,6 +169,7 @@ where
             result.events.iter().map(Cow::Borrowed),
             &mut transaction,
             self.balances_enabled,
+            &self.base_asset_id,
         )?;
 
         match self.da_compression_config {
@@ -195,6 +199,7 @@ pub fn process_executor_events<'a, Iter, T>(
     events: Iter,
     block_st_transaction: &mut T,
     balances_enabled: bool,
+    base_asset_id: &AssetId,
 ) -> anyhow::Result<()>
 where
     Iter: Iterator<Item = Cow<'a, Event>>,
@@ -205,6 +210,7 @@ where
             event.deref(),
             block_st_transaction,
             balances_enabled,
+            base_asset_id,
         ) {
             Ok(()) => (),
             Err(IndexationError::StorageError(err)) => {
@@ -511,6 +517,7 @@ where
             on_chain_database,
             off_chain_database,
             continue_on_error,
+            base_asset_id,
         } = self;
 
         let mut task = Task {
@@ -521,6 +528,7 @@ where
             da_compression_config,
             continue_on_error,
             balances_enabled,
+            base_asset_id,
         };
 
         let mut target_chain_height = on_chain_database.latest_height()?;
@@ -625,6 +633,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn new_service<TxPool, BlockImporter, OnChain, OffChain>(
     tx_pool: TxPool,
     block_importer: BlockImporter,
@@ -633,6 +642,7 @@ pub fn new_service<TxPool, BlockImporter, OnChain, OffChain>(
     chain_id: ChainId,
     da_compression_config: DaCompressionConfig,
     continue_on_error: bool,
+    base_asset_id: AssetId,
 ) -> ServiceRunner<InitializeTask<TxPool, BlockImporter, OnChain, OffChain>>
 where
     TxPool: ports::worker::TxPool,
@@ -649,5 +659,6 @@ where
         chain_id,
         da_compression_config,
         continue_on_error,
+        base_asset_id,
     })
 }

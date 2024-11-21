@@ -3,10 +3,7 @@ use fuel_core_storage::{
     StorageAsMut,
 };
 use fuel_core_types::{
-    entities::{
-        coins::coin::Coin,
-        Message,
-    },
+    entities::Message,
     fuel_tx::{
         Address,
         AssetId,
@@ -59,6 +56,7 @@ pub enum IndexationError {
 fn increase_message_balance<T>(
     block_st_transaction: &mut T,
     message: &Message,
+    base_asset_id: &AssetId,
 ) -> Result<(), IndexationError>
 where
     T: OffChainDatabaseTransaction,
@@ -70,16 +68,24 @@ where
         mut retryable,
         mut non_retryable,
     } = *current_balance;
-    if message.has_retryable_amount() {
+
+    let coin_update_amount = if message.has_retryable_amount() {
         retryable = retryable.saturating_add(message.amount() as u128);
+        0
     } else {
         non_retryable = non_retryable.saturating_add(message.amount() as u128);
-    }
+        message.amount()
+    };
     let new_balance = MessageBalance {
         retryable,
         non_retryable,
     };
-
+    increase_coin_balance(
+        block_st_transaction,
+        message.recipient(),
+        base_asset_id,
+        coin_update_amount,
+    )?;
     let storage = block_st_transaction.storage::<MessageBalances>();
     Ok(storage.insert(key, &new_balance)?)
 }
@@ -87,6 +93,7 @@ where
 fn decrease_message_balance<T>(
     block_st_transaction: &mut T,
     message: &Message,
+    base_asset_id: &AssetId,
 ) -> Result<(), IndexationError>
 where
     T: OffChainDatabaseTransaction,
@@ -97,11 +104,18 @@ where
         retryable,
         non_retryable,
     } = *storage.get(key)?.unwrap_or_default();
-    let current_balance = if message.has_retryable_amount() {
-        retryable
+    let (current_balance, coin_update_amount) = if message.has_retryable_amount() {
+        (retryable, 0)
     } else {
-        non_retryable
+        (non_retryable, message.amount())
     };
+
+    decrease_coin_balance(
+        block_st_transaction,
+        message.recipient(),
+        base_asset_id,
+        coin_update_amount,
+    )?;
 
     current_balance
         .checked_sub(message.amount() as u128)
@@ -130,15 +144,17 @@ where
 
 fn increase_coin_balance<T>(
     block_st_transaction: &mut T,
-    coin: &Coin,
+    owner: &Address,
+    asset_id: &AssetId,
+    amount: u64,
 ) -> Result<(), IndexationError>
 where
     T: OffChainDatabaseTransaction,
 {
-    let key = CoinBalancesKey::new(&coin.owner, &coin.asset_id);
+    let key = CoinBalancesKey::new(owner, asset_id);
     let storage = block_st_transaction.storage::<CoinBalances>();
     let current_amount = *storage.get(&key)?.unwrap_or_default();
-    let new_amount = current_amount.saturating_add(coin.amount as u128);
+    let new_amount = current_amount.saturating_add(amount as u128);
 
     let storage = block_st_transaction.storage::<CoinBalances>();
     Ok(storage.insert(&key, &new_amount)?)
@@ -146,22 +162,24 @@ where
 
 fn decrease_coin_balance<T>(
     block_st_transaction: &mut T,
-    coin: &Coin,
+    owner: &Address,
+    asset_id: &AssetId,
+    amount: u64,
 ) -> Result<(), IndexationError>
 where
     T: OffChainDatabaseTransaction,
 {
-    let key = CoinBalancesKey::new(&coin.owner, &coin.asset_id);
+    let key = CoinBalancesKey::new(owner, asset_id);
     let storage = block_st_transaction.storage::<CoinBalances>();
     let current_amount = *storage.get(&key)?.unwrap_or_default();
 
     current_amount
-        .checked_sub(coin.amount as u128)
+        .checked_sub(amount as u128)
         .ok_or_else(|| IndexationError::CoinBalanceWouldUnderflow {
-            owner: coin.owner,
-            asset_id: coin.asset_id,
+            owner: *owner,
+            asset_id: *asset_id,
             current_amount,
-            requested_deduction: coin.amount as u128,
+            requested_deduction: amount as u128,
         })
         .and_then(|new_amount| {
             block_st_transaction
@@ -175,6 +193,7 @@ pub(crate) fn process_balances_update<T>(
     event: &Event,
     block_st_transaction: &mut T,
     balances_enabled: bool,
+    base_asset_id: &AssetId,
 ) -> Result<(), IndexationError>
 where
     T: OffChainDatabaseTransaction,
@@ -185,13 +204,23 @@ where
 
     match event {
         Event::MessageImported(message) => {
-            increase_message_balance(block_st_transaction, message)
+            increase_message_balance(block_st_transaction, message, base_asset_id)
         }
         Event::MessageConsumed(message) => {
-            decrease_message_balance(block_st_transaction, message)
+            decrease_message_balance(block_st_transaction, message, base_asset_id)
         }
-        Event::CoinCreated(coin) => increase_coin_balance(block_st_transaction, coin),
-        Event::CoinConsumed(coin) => decrease_coin_balance(block_st_transaction, coin),
+        Event::CoinCreated(coin) => increase_coin_balance(
+            block_st_transaction,
+            &coin.owner,
+            &coin.asset_id,
+            coin.amount,
+        ),
+        Event::CoinConsumed(coin) => decrease_coin_balance(
+            block_st_transaction,
+            &coin.owner,
+            &coin.asset_id,
+            coin.amount,
+        ),
         Event::ForcedTransactionFailed { .. } => Ok(()),
     }
 }
@@ -234,6 +263,8 @@ mod tests {
             },
         },
     };
+
+    pub const BASE_ASSET_ID: AssetId = AssetId::zeroed();
 
     impl PartialEq for IndexationError {
         fn eq(&self, other: &Self) -> bool {
@@ -369,8 +400,13 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_DISABLED)
-                .expect("should process balance");
+            process_balances_update(
+                event,
+                &mut tx,
+                BALANCES_ARE_DISABLED,
+                &BASE_ASSET_ID,
+            )
+            .expect("should process balance");
         });
 
         let key = CoinBalancesKey::new(&owner_1, &asset_id_1);
@@ -426,7 +462,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -444,7 +480,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -462,7 +498,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -495,7 +531,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -526,7 +562,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -557,7 +593,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -607,7 +643,7 @@ mod tests {
             vec![Event::CoinCreated(make_coin(&owner, &asset_id, 1))];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -645,7 +681,7 @@ mod tests {
         ];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -672,7 +708,7 @@ mod tests {
             vec![Event::CoinCreated(make_coin(&owner, &asset_id_1, 100))];
 
         events.iter().for_each(|event| {
-            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED)
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
                 .expect("should process balance");
         });
 
@@ -700,10 +736,77 @@ mod tests {
         let actual_errors: Vec<_> = events
             .iter()
             .map(|event| {
-                process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED).unwrap_err()
+                process_balances_update(
+                    event,
+                    &mut tx,
+                    BALANCES_ARE_ENABLED,
+                    &BASE_ASSET_ID,
+                )
+                .unwrap_err()
             })
             .collect();
 
         assert_eq!(expected_errors, actual_errors);
+    }
+
+    #[test]
+    fn nonretryable_messages_also_update_coin_with_base_asset_id() {
+        use tempfile::TempDir;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut db: Database<OffChain> =
+            Database::open_rocksdb(tmp_dir.path(), None, Default::default(), 512)
+                .unwrap();
+        let mut tx = db.write_transaction();
+
+        const BALANCES_ARE_ENABLED: bool = true;
+
+        let owner = Address::from([1; 32]);
+        let non_base_asset_id = AssetId::from([11; 32]);
+
+        // Initial set of messages
+        let events: Vec<Event> = vec![
+            Event::CoinCreated(make_coin(&owner, &non_base_asset_id, 1000)),
+            Event::CoinCreated(make_coin(&owner, &BASE_ASSET_ID, 2000)),
+            Event::MessageImported(make_retryable_message(&owner, 100)),
+            Event::MessageImported(make_nonretryable_message(&owner, 300)),
+        ];
+
+        events.iter().for_each(|event| {
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
+                .expect("should process balance");
+        });
+
+        assert_message_balance(
+            &mut tx,
+            owner,
+            MessageBalance {
+                retryable: 100,
+                non_retryable: 300,
+            },
+        );
+        assert_coin_balance(&mut tx, owner, non_base_asset_id, 1000);
+        assert_coin_balance(&mut tx, owner, BASE_ASSET_ID, 2000 + 300);
+
+        // Consume messages
+        let events: Vec<Event> = vec![
+            Event::MessageConsumed(make_retryable_message(&owner, 1)),
+            Event::MessageConsumed(make_nonretryable_message(&owner, 2)),
+        ];
+
+        events.iter().for_each(|event| {
+            process_balances_update(event, &mut tx, BALANCES_ARE_ENABLED, &BASE_ASSET_ID)
+                .expect("should process balance");
+        });
+
+        assert_message_balance(
+            &mut tx,
+            owner,
+            MessageBalance {
+                retryable: 99,
+                non_retryable: 298,
+            },
+        );
+        assert_coin_balance(&mut tx, owner, non_base_asset_id, 1000);
+        assert_coin_balance(&mut tx, owner, BASE_ASSET_ID, 2000 + 298);
     }
 }
