@@ -31,10 +31,6 @@ use futures::{
     StreamExt,
     TryStreamExt,
 };
-use tracing::{
-    debug,
-    error,
-};
 
 pub mod asset_query;
 
@@ -46,10 +42,8 @@ impl ReadView {
         base_asset_id: AssetId,
     ) -> StorageResult<AddressBalance> {
         let amount = if self.balances_enabled {
-            debug!(%owner, %asset_id, "Querying balance with balances cache");
             self.off_chain.balance(&owner, &asset_id)?
         } else {
-            debug!(%owner, %asset_id, "Querying balance without balances cache");
             AssetQuery::new(
                 &owner,
                 &AssetSpendTarget::new(asset_id, u64::MAX, u16::MAX),
@@ -60,14 +54,7 @@ impl ReadView {
             .coins()
             .map(|res| res.map(|coins| coins.amount()))
             .try_fold(0u128, |balance, amount| async move {
-                Ok(balance.checked_add(amount as u128).unwrap_or_else(|| {
-                    // TODO[RC]: Balances overflow to be correctly handled. See: https://github.com/FuelLabs/fuel-core/issues/2428
-                    error!(
-                        %asset_id,
-                        prev_balance=%balance,
-                        "unable to change balance due to overflow");
-                    u128::MAX
-                }))
+                Ok(balance.saturating_add(amount as TotalBalanceAmount))
             })
             .await? as TotalBalanceAmount
         };
@@ -102,7 +89,6 @@ impl ReadView {
         base_asset_id: &'a AssetId,
         direction: IterDirection,
     ) -> impl Stream<Item = StorageResult<AddressBalance>> + 'a {
-        debug!(%owner, "Querying balances without balances cache");
         let query = AssetsQuery::new(owner, None, None, self, base_asset_id);
         let stream = query.coins();
 
@@ -113,16 +99,8 @@ impl ReadView {
                     let amount: &mut TotalBalanceAmount = amounts_per_asset
                         .entry(*coin.asset_id(base_asset_id))
                         .or_default();
-                    let new_amount = amount
-                        .checked_add(coin.amount() as TotalBalanceAmount)
-                        .unwrap_or_else(|| {
-                            // TODO[RC]: Balances overflow to be correctly handled. See: https://github.com/FuelLabs/fuel-core/issues/2428
-                            error!(
-                                asset_id=%coin.asset_id(base_asset_id),
-                                prev_balance=%amount,
-                                "unable to change balance due to overflow");
-                            u128::MAX
-                        });
+                    let new_amount =
+                        amount.saturating_add(coin.amount() as TotalBalanceAmount);
                     *amount = new_amount;
                     Ok(amounts_per_asset)
                 },
@@ -162,8 +140,6 @@ impl ReadView {
         owner: &'a Address,
         direction: IterDirection,
     ) -> impl Stream<Item = StorageResult<AddressBalance>> + 'a {
-        debug!(%owner, "Querying balances using balances cache");
-
         stream::iter(self.off_chain.balances(owner, direction))
             .map(move |result| {
                 result.map(|(asset_id, amount)| AddressBalance {
