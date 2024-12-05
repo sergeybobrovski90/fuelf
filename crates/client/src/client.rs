@@ -78,6 +78,10 @@ use pagination::{
     PaginationRequest,
 };
 use schema::{
+    assets::{
+        AssetInfoArg,
+        AssetInfoDetails,
+    },
     balance::BalanceArgs,
     blob::BlobByIdArgs,
     block::BlockByIdArgs,
@@ -1190,6 +1194,17 @@ impl FuelClient {
             .map(|status| status.try_into())
             .transpose()?;
         Ok(status)
+    }
+
+    pub async fn asset_info(
+        &self,
+        asset_id: &AssetId,
+    ) -> io::Result<Option<AssetInfoDetails>> {
+        let query = schema::assets::AssetInfoQuery::build(AssetInfoArg {
+            id: (*asset_id).into(),
+        });
+        let asset_info = self.query(query).await?.asset_details.map(Into::into);
+        Ok(asset_info)
     }
 }
 

@@ -30,6 +30,7 @@ use futures::{
 use std::borrow::Cow;
 use tokio_stream::StreamExt;
 
+pub mod assets;
 pub mod balance;
 pub mod blob;
 pub mod block;
@@ -51,6 +52,7 @@ pub mod relayed_tx;
 
 #[derive(MergedObject, Default)]
 pub struct Query(
+    assets::AssetInfoQuery,
     dap::DapQuery,
     balance::BalanceQuery,
     blob::BlobQuery,
@@ -142,7 +144,7 @@ where
             } else if let Some(last) = last {
                 (last, IterDirection::Reverse)
             } else {
-                return Err(anyhow!("Either `first` or `last` should be provided"))
+                return Err(anyhow!("Either `first` or `last` should be provided"));
             };
 
             let start;
@@ -170,7 +172,7 @@ where
                         // Skip until start + 1
                         if key == start {
                             has_previous_page = true;
-                            return true
+                            return true;
                         }
                     }
                 }
@@ -184,7 +186,7 @@ where
                         // take until we've reached the end
                         if key == end {
                             has_next_page = true;
-                            return false
+                            return false;
                         }
                     }
                     count = count.saturating_sub(1);

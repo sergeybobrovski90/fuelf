@@ -64,7 +64,10 @@ use fuel_core_types::{
 };
 use std::sync::Arc;
 
-use super::storage::balances::TotalBalanceAmount;
+use super::storage::{
+    assets::AssetDetails,
+    balances::TotalBalanceAmount,
+};
 
 pub trait OffChainDatabase: Send + Sync {
     fn block_height(&self, block_id: &BlockId) -> StorageResult<BlockHeight>;
@@ -128,6 +131,10 @@ pub trait OffChainDatabase: Send + Sync {
     ) -> StorageResult<Option<RelayedTransactionStatus>>;
 
     fn message_is_spent(&self, nonce: &Nonce) -> StorageResult<bool>;
+
+    fn asset_info(&self, asset_id: &AssetId) -> StorageResult<Option<AssetDetails>>;
+
+    fn asset_exists(&self, asset_id: &AssetId) -> StorageResult<bool>;
 }
 
 /// The on chain database port expected by GraphQL API service.
@@ -289,6 +296,7 @@ pub mod worker {
             },
         },
         graphql_api::storage::{
+            assets::AssetsInfo,
             balances::{
                 CoinBalances,
                 MessageBalances,
@@ -371,6 +379,7 @@ pub mod worker {
         + StorageMutate<DaCompressionTemporalRegistryIndex, Error = StorageError>
         + StorageMutate<DaCompressionTemporalRegistryTimestamps, Error = StorageError>
         + StorageMutate<DaCompressionTemporalRegistryEvictorCache, Error = StorageError>
+        + StorageMutate<AssetsInfo, Error = StorageError>
     {
         fn record_tx_id_owner(
             &mut self,

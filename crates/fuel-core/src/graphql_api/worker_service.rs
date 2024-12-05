@@ -3,10 +3,13 @@ use self::indexation::IndexationError;
 use super::{
     da_compression::da_compress_block,
     indexation,
-    storage::old::{
-        OldFuelBlockConsensus,
-        OldFuelBlocks,
-        OldTransactions,
+    storage::{
+        assets::AssetsInfo,
+        old::{
+            OldFuelBlockConsensus,
+            OldFuelBlocks,
+            OldTransactions,
+        },
     },
 };
 use crate::{
@@ -70,8 +73,10 @@ use fuel_core_types::{
             CoinSigned,
         },
         Contract,
+        ContractIdExt,
         Input,
         Output,
+        Receipt,
         Transaction,
         TxId,
         UniqueIdentifier,
@@ -380,6 +385,64 @@ where
                 id
             )
             .into());
+        }
+
+        for receipt in result.receipts() {
+            match receipt {
+                Receipt::Mint {
+                    sub_id,
+                    contract_id,
+                    val,
+                    ..
+                } => {
+                    let asset_id = contract_id.asset_id(sub_id);
+                    let current_count = match db.storage::<AssetsInfo>().get(&asset_id) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            // If asset doesn't exist yet, create it with 0 count
+                            db.storage::<AssetsInfo>()
+                                .insert(&asset_id, &(*contract_id, **sub_id, 0))?;
+                            Some(Cow::Owned((*contract_id, **sub_id, 0)))
+                        }
+                    }
+                    .map(|info| {
+                        info.2
+                            .checked_add(*val)
+                            .ok_or(anyhow::anyhow!("Asset count overflow"))
+                    })
+                    .transpose()?
+                    .unwrap_or(*val);
+
+                    db.storage::<AssetsInfo>()
+                        .insert(&asset_id, &(*contract_id, **sub_id, current_count))?;
+                }
+                Receipt::Burn {
+                    sub_id,
+                    contract_id,
+                    val,
+                    ..
+                } => {
+                    let asset_id = contract_id.asset_id(sub_id);
+                    let current_count = db
+                        .storage::<AssetsInfo>()
+                        .get(&asset_id)
+                        .unwrap_or_else(|_| {
+                            tracing::warn!("Asset {} is not currently indexed", asset_id);
+                            None
+                        })
+                        .map(|info| {
+                            info.2
+                                .checked_sub(*val)
+                                .ok_or(anyhow::anyhow!("Asset count overflow"))
+                        })
+                        .transpose()?
+                        .unwrap_or(*val);
+
+                    db.storage::<AssetsInfo>()
+                        .insert(&asset_id, &(*contract_id, **sub_id, current_count))?;
+                }
+                _ => {}
+            }
         }
     }
     Ok(())

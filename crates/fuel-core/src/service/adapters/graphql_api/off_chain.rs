@@ -20,6 +20,10 @@ use crate::{
         },
     },
     graphql_api::storage::{
+        assets::{
+            AssetDetails,
+            AssetsInfo,
+        },
         balances::{
             CoinBalances,
             CoinBalancesKey,
@@ -202,6 +206,15 @@ impl OffChainDatabase for OffChainIterableKeyValueView {
         self.message_is_spent(nonce)
     }
 
+    fn asset_info(&self, asset_id: &AssetId) -> StorageResult<Option<AssetDetails>> {
+        self.storage_as_ref::<AssetsInfo>()
+            .get(asset_id)
+            .map(|opt| opt.map(|cow| cow.into_owned()))
+    }
+
+    fn asset_exists(&self, asset_id: &AssetId) -> StorageResult<bool> {
+        self.storage_as_ref::<AssetsInfo>().contains_key(asset_id)
+    }
     fn balance(
         &self,
         owner: &Address,
