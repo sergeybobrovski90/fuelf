@@ -1,4 +1,7 @@
-use super::scalars::U64;
+use super::scalars::{
+    U32,
+    U64,
+};
 use crate::{
     fuel_core_graphql_api::{
         api_service::{
@@ -73,6 +76,8 @@ use std::{
 };
 use types::{
     DryRunTransactionExecutionStatus,
+    TraceTransactionExecutionStatus,
+    TraceTrigger,
     Transaction,
 };
 
@@ -329,6 +334,25 @@ impl TxMutation {
             .collect();
 
         Ok(tx_statuses)
+    }
+
+    /// Get execution trace for an already-executed transaction.
+    #[graphql(complexity = "query_costs().dry_run + child_complexity")]
+    async fn execution_trace_block(
+        &self,
+        ctx: &Context<'_>,
+        height: U32,
+        trigger: TraceTrigger,
+    ) -> async_graphql::Result<Vec<TraceTransactionExecutionStatus>> {
+        let block_height = height.into();
+        let block_producer = ctx.data_unchecked::<BlockProducer>();
+        let status = block_producer
+            .execution_trace_block(block_height, trigger.into())
+            .await?;
+        Ok(status
+            .into_iter()
+            .map(TraceTransactionExecutionStatus)
+            .collect())
     }
 
     /// Submits transaction to the `TxPool`.
