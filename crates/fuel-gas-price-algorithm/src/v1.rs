@@ -1,10 +1,10 @@
+use crate::utils::cumulative_percentage_change;
 use std::{
     cmp::max,
+    collections::BTreeMap,
     num::NonZeroU64,
     ops::Div,
 };
-
-use crate::utils::cumulative_percentage_change;
 
 #[cfg(test)]
 mod tests;
@@ -13,14 +13,20 @@ mod tests;
 pub enum Error {
     #[error("Skipped L2 block update: expected {expected:?}, got {got:?}")]
     SkippedL2Block { expected: u32, got: u32 },
-    #[error("Skipped DA block update: expected {expected:?}, got {got:?}")]
-    SkippedDABlock { expected: u32, got: u32 },
     #[error("Could not calculate cost per byte: {bytes:?} bytes, {cost:?} cost")]
-    CouldNotCalculateCostPerByte { bytes: u64, cost: u64 },
+    CouldNotCalculateCostPerByte { bytes: u128, cost: u128 },
     #[error("Failed to include L2 block data: {0}")]
-    FailedTooIncludeL2BlockData(String),
+    FailedToIncludeL2BlockData(String),
+    #[error("L2 block expected but not found in unrecorded blocks: {height}")]
+    L2BlockExpectedNotFound { height: u32 },
+    #[error("Could not insert unrecorded block: {0}")]
+    CouldNotInsertUnrecordedBlock(String),
+    #[error("Could not remove unrecorded block: {0}")]
+    CouldNotRemoveUnrecordedBlock(String),
 }
 
+// TODO: separate exec gas price and DA gas price into newtypes for clarity
+//   https://github.com/FuelLabs/fuel-core/issues/2382
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlgorithmV1 {
     /// The gas price for to cover the execution of the next block
@@ -54,6 +60,27 @@ impl AlgorithmV1 {
             height,
         );
         exec.saturating_add(da)
+    }
+}
+
+pub type Height = u32;
+pub type Bytes = u64;
+
+pub trait UnrecordedBlocks {
+    fn insert(&mut self, height: Height, bytes: Bytes) -> Result<(), String>;
+
+    fn remove(&mut self, height: &Height) -> Result<Option<Bytes>, String>;
+}
+
+impl UnrecordedBlocks for BTreeMap<Height, Bytes> {
+    fn insert(&mut self, height: Height, bytes: Bytes) -> Result<(), String> {
+        self.insert(height, bytes);
+        Ok(())
+    }
+
+    fn remove(&mut self, height: &Height) -> Result<Option<Bytes>, String> {
+        let value = self.remove(height);
+        Ok(value)
     }
 }
 
@@ -111,13 +138,8 @@ pub struct AlgorithmUpdaterV1 {
     /// This is a percentage of the total capacity of the L2 block
     pub l2_block_fullness_threshold_percent: ClampedPercentage,
     // DA
-    /// The gas price for the DA portion of the last block. This can be used to calculate
-    /// the DA portion of the next block
-    // pub last_da_gas_price: u64,
-
     /// The gas price (scaled by the `gas_price_factor`) to cover the DA commitment of the next block
     pub new_scaled_da_gas_price: u64,
-
     /// Scale factor for the gas price.
     pub gas_price_factor: NonZeroU64,
     /// The lowest the algorithm allows the da gas price to go
@@ -127,8 +149,6 @@ pub struct AlgorithmUpdaterV1 {
     pub max_da_gas_price_change_percent: u16,
     /// The cumulative reward from the DA portion of the gas price
     pub total_da_rewards_excess: u128,
-    /// The height of the last L2 block recorded on the DA chain
-    pub da_recorded_block_height: u32,
     /// The cumulative cost of recording L2 blocks on the DA chain as of the last recorded block
     pub latest_known_total_da_cost_excess: u128,
     /// The predicted cost of recording L2 blocks on the DA chain as of the last L2 block
@@ -144,12 +164,154 @@ pub struct AlgorithmUpdaterV1 {
     pub second_to_last_profit: i128,
     /// The latest known cost per byte for recording blocks on the DA chain
     pub latest_da_cost_per_byte: u128,
-    /// The unrecorded blocks that are used to calculate the projected cost of recording blocks
-    pub unrecorded_blocks: Vec<BlockBytes>,
+    /// Activity of L2
+    pub l2_activity: L2ActivityTracker,
+    /// Total unrecorded block bytes
+    pub unrecorded_blocks_bytes: u128,
+}
+
+/// The `L2ActivityTracker` tracks the chain activity to determine a safety mode for setting the DA price.
+///
+/// Because the DA gas price can increase even when no-one is using the network, there is a potential
+/// for a negative feedback loop to occur where the gas price increases, further decreasing activity
+/// and increasing the gas price. The `L2ActivityTracker` is used to moderate changes to the DA
+/// gas price based on the activity of the L2 chain.
+///
+/// The chain activity is a cumulative measure, updated whenever a new block is processed.
+/// For each L2 block, the block usage is a percentage of the block capacity used. If the
+/// block usage is below a certain threshold, the chain activity is decreased, if above the threshold,
+/// the activity is increased The chain activity exists on a scale
+/// between 0 and the sum of the normal, capped, and decrease buffers.
+///
+/// e.g. if the decrease activity threshold is 20, the capped activity threshold is 80, and the max activity is 120,
+/// we'd have the following ranges:
+///
+/// 0 <-- decrease range -->20<-- capped range -->80<-- normal range -->120
+///
+/// The current chain activity determines the behavior of the DA gas price.
+///
+/// For healthy behavior, the activity should be in the `normal` range.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct L2ActivityTracker {
+    /// The maximum value the chain activity can hit
+    max_activity: u16,
+    /// The threshold if the block activity is below, the DA gas price will be held when it would otherwise be increased
+    capped_activity_threshold: u16,
+    /// If the chain activity falls below this value, the DA gas price will be decreased when it would otherwise be increased
+    decrease_activity_threshold: u16,
+    /// The current activity of the L2 chain
+    chain_activity: u16,
+    /// The threshold of block activity below which the chain activity will be decreased,
+    /// above or equal it will always increase
+    block_activity_threshold: ClampedPercentage,
+}
+
+/// Designates the intended behavior of the DA gas price based on the activity of the L2 chain
+pub enum DAGasPriceSafetyMode {
+    /// Should increase DA gas price freely
+    Normal,
+    /// Should not increase the DA gas price
+    Capped,
+    /// Should decrease the DA gas price always
+    AlwaysDecrease,
+}
+
+impl L2ActivityTracker {
+    pub fn new_full(
+        normal_range_size: u16,
+        capped_range_size: u16,
+        decrease_range_size: u16,
+        block_activity_threshold: ClampedPercentage,
+    ) -> Self {
+        let decrease_activity_threshold = decrease_range_size;
+        let capped_activity_threshold =
+            decrease_range_size.saturating_add(capped_range_size);
+        let max_activity = capped_activity_threshold.saturating_add(normal_range_size);
+        let chain_activity = max_activity;
+        Self {
+            max_activity,
+            capped_activity_threshold,
+            decrease_activity_threshold,
+            chain_activity,
+            block_activity_threshold,
+        }
+    }
+
+    pub fn new(
+        normal_range_size: u16,
+        capped_range_size: u16,
+        decrease_range_size: u16,
+        activity: u16,
+        block_activity_threshold: ClampedPercentage,
+    ) -> Self {
+        let mut tracker = Self::new_full(
+            normal_range_size,
+            capped_range_size,
+            decrease_range_size,
+            block_activity_threshold,
+        );
+        tracker.chain_activity = activity.min(tracker.max_activity);
+        tracker
+    }
+
+    pub fn new_always_normal() -> Self {
+        let normal_range_size = 100;
+        let capped_range_size = 0;
+        let decrease_range_size = 0;
+        let percentage = ClampedPercentage::new(0);
+        Self::new(
+            normal_range_size,
+            capped_range_size,
+            decrease_range_size,
+            100,
+            percentage,
+        )
+    }
+
+    pub fn safety_mode(&self) -> DAGasPriceSafetyMode {
+        if self.chain_activity > self.capped_activity_threshold {
+            DAGasPriceSafetyMode::Normal
+        } else if self.chain_activity > self.decrease_activity_threshold {
+            DAGasPriceSafetyMode::Capped
+        } else {
+            DAGasPriceSafetyMode::AlwaysDecrease
+        }
+    }
+
+    pub fn update(&mut self, block_usage: ClampedPercentage) {
+        if block_usage < self.block_activity_threshold {
+            self.chain_activity = self.chain_activity.saturating_sub(1);
+        } else {
+            self.chain_activity =
+                self.chain_activity.saturating_add(1).min(self.max_activity);
+        }
+    }
+
+    pub fn current_activity(&self) -> u16 {
+        self.chain_activity
+    }
+
+    pub fn max_activity(&self) -> u16 {
+        self.max_activity
+    }
+
+    pub fn capped_activity_threshold(&self) -> u16 {
+        self.capped_activity_threshold
+    }
+
+    pub fn decrease_activity_threshold(&self) -> u16 {
+        self.decrease_activity_threshold
+    }
+
+    pub fn block_activity_threshold(&self) -> ClampedPercentage {
+        self.block_activity_threshold
+    }
 }
 
 /// A value that represents a value between 0 and 100. Higher values are clamped to 100
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Copy, Clone, PartialEq, PartialOrd,
+)]
 pub struct ClampedPercentage {
     value: u8,
 }
@@ -176,39 +338,35 @@ impl core::ops::Deref for ClampedPercentage {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RecordedBlock {
-    pub height: u32,
-    pub block_bytes: u64,
-    pub block_cost: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-pub struct BlockBytes {
-    pub height: u32,
-    pub block_bytes: u64,
-}
-
 impl AlgorithmUpdaterV1 {
-    pub fn update_da_record_data(
+    pub fn update_da_record_data<U: UnrecordedBlocks>(
         &mut self,
-        blocks: &[RecordedBlock],
+        heights: &[u32],
+        recorded_bytes: u32,
+        recording_cost: u128,
+        unrecorded_blocks: &mut U,
     ) -> Result<(), Error> {
-        for block in blocks {
-            self.da_block_update(block.height, block.block_bytes, block.block_cost)?;
+        if !heights.is_empty() {
+            self.da_block_update(
+                heights,
+                recorded_bytes as u128,
+                recording_cost,
+                unrecorded_blocks,
+            )?;
+            self.recalculate_projected_cost();
+            self.update_da_gas_price();
         }
-        self.recalculate_projected_cost();
-        self.normalize_rewards_and_costs();
         Ok(())
     }
 
-    pub fn update_l2_block_data(
+    pub fn update_l2_block_data<U: UnrecordedBlocks>(
         &mut self,
         height: u32,
         used: u64,
         capacity: NonZeroU64,
         block_bytes: u64,
-        fee_wei: u64,
+        fee_wei: u128,
+        unrecorded_blocks: &mut U,
     ) -> Result<(), Error> {
         let expected = self.l2_block_height.saturating_add(1);
         if height != expected {
@@ -220,36 +378,48 @@ impl AlgorithmUpdaterV1 {
             self.l2_block_height = height;
 
             // rewards
-            self.update_rewards(fee_wei);
+            self.update_da_rewards(fee_wei);
             let rewards = self.clamped_rewards_as_i128();
 
             // costs
-            self.update_projected_cost(block_bytes);
+            self.update_projected_da_cost(block_bytes);
             let projected_total_da_cost = self.clamped_projected_cost_as_i128();
+
+            // profit
             let last_profit = rewards.saturating_sub(projected_total_da_cost);
             self.update_last_profit(last_profit);
+
+            // activity
+            self.update_activity(used, capacity);
 
             // gas prices
             self.update_exec_gas_price(used, capacity);
             self.update_da_gas_price();
 
             // metadata
-            self.unrecorded_blocks.push(BlockBytes {
-                height,
-                block_bytes,
-            });
+            unrecorded_blocks
+                .insert(height, block_bytes)
+                .map_err(Error::CouldNotInsertUnrecordedBlock)?;
+            self.unrecorded_blocks_bytes = self
+                .unrecorded_blocks_bytes
+                .saturating_add(block_bytes as u128);
             Ok(())
         }
     }
 
-    fn update_rewards(&mut self, fee_wei: u64) {
-        let block_da_reward = self.da_portion_of_fee(fee_wei);
-        self.total_da_rewards_excess = self
-            .total_da_rewards_excess
-            .saturating_add(block_da_reward.into());
+    fn update_activity(&mut self, used: u64, capacity: NonZeroU64) {
+        let block_activity = used.saturating_mul(100).div(capacity);
+        let usage = ClampedPercentage::new(block_activity.try_into().unwrap_or(100));
+        self.l2_activity.update(usage);
     }
 
-    fn update_projected_cost(&mut self, block_bytes: u64) {
+    fn update_da_rewards(&mut self, fee_wei: u128) {
+        let block_da_reward = self.da_portion_of_fee(fee_wei);
+        self.total_da_rewards_excess =
+            self.total_da_rewards_excess.saturating_add(block_da_reward);
+    }
+
+    fn update_projected_da_cost(&mut self, block_bytes: u64) {
         let block_projected_da_cost =
             (block_bytes as u128).saturating_mul(self.latest_da_cost_per_byte);
         self.projected_total_da_cost = self
@@ -258,12 +428,11 @@ impl AlgorithmUpdaterV1 {
     }
 
     // Take the `fee_wei` and return the portion of the fee that should be used for paying DA costs
-    fn da_portion_of_fee(&self, fee_wei: u64) -> u64 {
+    fn da_portion_of_fee(&self, fee_wei: u128) -> u128 {
         // fee_wei * (da_price / (exec_price + da_price))
-        let numerator = fee_wei.saturating_mul(self.descaled_da_price());
-        let denominator = self
-            .descaled_exec_price()
-            .saturating_add(self.descaled_da_price());
+        let numerator = fee_wei.saturating_mul(self.descaled_da_price() as u128);
+        let denominator = (self.descaled_exec_price() as u128)
+            .saturating_add(self.descaled_da_price() as u128);
         if denominator == 0 {
             0
         } else {
@@ -317,7 +486,8 @@ impl AlgorithmUpdaterV1 {
     fn update_da_gas_price(&mut self) {
         let p = self.p();
         let d = self.d();
-        let da_change = self.da_change(p, d);
+        let maybe_da_change = self.da_change(p, d);
+        let da_change = self.da_change_accounting_for_activity(maybe_da_change);
         let maybe_new_scaled_da_gas_price = i128::from(self.new_scaled_da_gas_price)
             .checked_add(da_change)
             .and_then(|x| u64::try_from(x).ok())
@@ -332,6 +502,20 @@ impl AlgorithmUpdaterV1 {
             self.min_scaled_da_gas_price(),
             maybe_new_scaled_da_gas_price,
         );
+    }
+
+    fn da_change_accounting_for_activity(&self, maybe_da_change: i128) -> i128 {
+        if maybe_da_change > 0 {
+            match self.l2_activity.safety_mode() {
+                DAGasPriceSafetyMode::Normal => maybe_da_change,
+                DAGasPriceSafetyMode::Capped => 0,
+                DAGasPriceSafetyMode::AlwaysDecrease => {
+                    self.max_change().saturating_mul(-1)
+                }
+            }
+        } else {
+            maybe_da_change
+        }
     }
 
     fn min_scaled_da_gas_price(&self) -> u64 {
@@ -356,14 +540,18 @@ impl AlgorithmUpdaterV1 {
 
     fn da_change(&self, p: i128, d: i128) -> i128 {
         let pd_change = p.saturating_add(d);
-        let upcast_percent = self.max_da_gas_price_change_percent.into();
-        let max_change = self
-            .new_scaled_da_gas_price
-            .saturating_mul(upcast_percent)
-            .saturating_div(100)
-            .into();
+        let max_change = self.max_change();
         let clamped_change = pd_change.saturating_abs().min(max_change);
         pd_change.signum().saturating_mul(clamped_change)
+    }
+
+    // Should always be positive
+    fn max_change(&self) -> i128 {
+        let upcast_percent = self.max_da_gas_price_change_percent.into();
+        self.new_scaled_da_gas_price
+            .saturating_mul(upcast_percent)
+            .saturating_div(100)
+            .into()
     }
 
     fn exec_change(&self, principle: u64) -> u64 {
@@ -372,47 +560,64 @@ impl AlgorithmUpdaterV1 {
             .saturating_div(100)
     }
 
-    fn da_block_update(
+    fn da_block_update<U: UnrecordedBlocks>(
         &mut self,
-        height: u32,
-        block_bytes: u64,
-        block_cost: u64,
+        heights: &[u32],
+        recorded_bytes: u128,
+        recording_cost: u128,
+        unrecorded_blocks: &mut U,
     ) -> Result<(), Error> {
-        let expected = self.da_recorded_block_height.saturating_add(1);
-        if height != expected {
-            Err(Error::SkippedDABlock {
-                expected: self.da_recorded_block_height.saturating_add(1),
-                got: height,
-            })
-        } else {
-            let new_cost_per_byte: u128 = (block_cost as u128)
-                .checked_div(block_bytes as u128)
-                .ok_or(Error::CouldNotCalculateCostPerByte {
-                    bytes: block_bytes,
-                    cost: block_cost,
-                })?;
-            self.da_recorded_block_height = height;
-            let new_block_cost = self
-                .latest_known_total_da_cost_excess
-                .saturating_add(block_cost as u128);
-            self.latest_known_total_da_cost_excess = new_block_cost;
-            self.latest_da_cost_per_byte = new_cost_per_byte;
-            Ok(())
+        self.update_unrecorded_block_bytes(heights, unrecorded_blocks)?;
+
+        let new_da_block_cost = self
+            .latest_known_total_da_cost_excess
+            .saturating_add(recording_cost);
+        self.latest_known_total_da_cost_excess = new_da_block_cost;
+
+        let compressed_cost_per_bytes = recording_cost
+            .checked_div(recorded_bytes)
+            .ok_or(Error::CouldNotCalculateCostPerByte {
+                bytes: recorded_bytes,
+                cost: recording_cost,
+            })?;
+
+        // This is often "pessimistic" in the sense that we are charging for the compressed blocks
+        // and we will use it to calculate base on the uncompressed blocks
+        self.latest_da_cost_per_byte = compressed_cost_per_bytes;
+        Ok(())
+    }
+
+    // Get the bytes for all specified heights, or get none of them.
+    // Always remove the blocks from the unrecorded blocks so they don't build up indefinitely
+    fn update_unrecorded_block_bytes<U: UnrecordedBlocks>(
+        &mut self,
+        heights: &[u32],
+        unrecorded_blocks: &mut U,
+    ) -> Result<(), Error> {
+        let mut total: u128 = 0;
+        for expected_height in heights {
+            let maybe_bytes = unrecorded_blocks
+                .remove(expected_height)
+                .map_err(Error::CouldNotRemoveUnrecordedBlock)?;
+
+            if let Some(bytes) = maybe_bytes {
+                total = total.saturating_add(bytes as u128);
+            } else {
+                tracing::warn!(
+                    "L2 block expected but not found in unrecorded blocks: {}",
+                    expected_height,
+                );
+            }
         }
+        self.unrecorded_blocks_bytes = self.unrecorded_blocks_bytes.saturating_sub(total);
+
+        Ok(())
     }
 
     fn recalculate_projected_cost(&mut self) {
-        // remove all blocks that have been recorded
-        self.unrecorded_blocks
-            .retain(|block| block.height > self.da_recorded_block_height);
-        // add the cost of the remaining blocks
-        let projection_portion: u128 = self
-            .unrecorded_blocks
-            .iter()
-            .map(|block| {
-                (block.block_bytes as u128).saturating_mul(self.latest_da_cost_per_byte)
-            })
-            .sum();
+        let projection_portion = self
+            .unrecorded_blocks_bytes
+            .saturating_mul(self.latest_da_cost_per_byte);
         self.projected_total_da_cost = self
             .latest_known_total_da_cost_excess
             .saturating_add(projection_portion);
@@ -433,36 +638,6 @@ impl AlgorithmUpdaterV1 {
             new_da_gas_price: self.descaled_da_price(),
             da_gas_price_percentage: self.max_da_gas_price_change_percent as u64,
             for_height: self.l2_block_height,
-        }
-    }
-
-    // We only need to track the difference between the rewards and costs after we have true DA data
-    // Normalize, or zero out the lower value and subtract it from the higher value
-    fn normalize_rewards_and_costs(&mut self) {
-        let (excess, projected_cost_excess) =
-            if self.total_da_rewards_excess > self.latest_known_total_da_cost_excess {
-                (
-                    self.total_da_rewards_excess
-                        .saturating_sub(self.latest_known_total_da_cost_excess),
-                    self.projected_total_da_cost
-                        .saturating_sub(self.latest_known_total_da_cost_excess),
-                )
-            } else {
-                (
-                    self.latest_known_total_da_cost_excess
-                        .saturating_sub(self.total_da_rewards_excess),
-                    self.projected_total_da_cost
-                        .saturating_sub(self.total_da_rewards_excess),
-                )
-            };
-
-        self.projected_total_da_cost = projected_cost_excess;
-        if self.total_da_rewards_excess > self.latest_known_total_da_cost_excess {
-            self.total_da_rewards_excess = excess;
-            self.latest_known_total_da_cost_excess = 0;
-        } else {
-            self.total_da_rewards_excess = 0;
-            self.latest_known_total_da_cost_excess = excess;
         }
     }
 }

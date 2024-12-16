@@ -1,12 +1,23 @@
-use super::storage::old::{
-    OldFuelBlockConsensus,
-    OldFuelBlocks,
-    OldTransactions,
+use self::indexation::IndexationError;
+
+use super::{
+    da_compression::da_compress_block,
+    indexation,
+    storage::old::{
+        OldFuelBlockConsensus,
+        OldFuelBlocks,
+        OldTransactions,
+    },
 };
 use crate::{
     fuel_core_graphql_api::{
-        ports,
-        ports::worker::OffChainDatabaseTransaction,
+        ports::{
+            self,
+            worker::{
+                BlockAt,
+                OffChainDatabaseTransaction,
+            },
+        },
         storage::{
             blocks::FuelBlockIdsToHeights,
             coins::{
@@ -31,13 +42,13 @@ use fuel_core_services::{
     RunnableTask,
     ServiceRunner,
     StateWatcher,
+    TaskNextAction,
 };
 use fuel_core_storage::{
     Error as StorageError,
     Result as StorageResult,
     StorageAsMut,
 };
-use fuel_core_txpool::types::TxId;
 use fuel_core_types::{
     blockchain::{
         block::{
@@ -62,6 +73,7 @@ use fuel_core_types::{
         Input,
         Output,
         Transaction,
+        TxId,
         UniqueIdentifier,
     },
     fuel_types::{
@@ -93,9 +105,16 @@ use std::{
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug, Clone)]
+pub enum DaCompressionConfig {
+    Disabled,
+    Enabled(fuel_core_compression::config::Config),
+}
+
 /// The initialization task recovers the state of the GraphQL service database on startup.
 pub struct InitializeTask<TxPool, BlockImporter, OnChain, OffChain> {
     chain_id: ChainId,
+    da_compression_config: DaCompressionConfig,
     continue_on_error: bool,
     tx_pool: TxPool,
     blocks_events: BoxStream<SharedImportResult>,
@@ -111,7 +130,9 @@ pub struct Task<TxPool, D> {
     block_importer: BoxStream<SharedImportResult>,
     database: D,
     chain_id: ChainId,
+    da_compression_config: DaCompressionConfig,
     continue_on_error: bool,
+    balances_enabled: bool,
 }
 
 impl<TxPool, D> Task<TxPool, D>
@@ -134,7 +155,7 @@ where
         let height = block.header().height();
         let block_id = block.id();
         transaction
-            .storage::<FuelBlockIdsToHeights>()
+            .storage_as_mut::<FuelBlockIdsToHeights>()
             .insert(&block_id, height)?;
 
         let total_tx_count = transaction
@@ -144,7 +165,15 @@ where
         process_executor_events(
             result.events.iter().map(Cow::Borrowed),
             &mut transaction,
+            self.balances_enabled,
         )?;
+
+        match self.da_compression_config {
+            DaCompressionConfig::Disabled => {}
+            DaCompressionConfig::Enabled(config) => {
+                da_compress_block(config, block, &result.events, &mut transaction)?;
+            }
+        }
 
         transaction.commit()?;
 
@@ -165,12 +194,29 @@ where
 pub fn process_executor_events<'a, Iter, T>(
     events: Iter,
     block_st_transaction: &mut T,
+    balances_enabled: bool,
 ) -> anyhow::Result<()>
 where
     Iter: Iterator<Item = Cow<'a, Event>>,
     T: OffChainDatabaseTransaction,
 {
     for event in events {
+        match indexation::process_balances_update(
+            event.deref(),
+            block_st_transaction,
+            balances_enabled,
+        ) {
+            Ok(()) => (),
+            Err(IndexationError::StorageError(err)) => {
+                return Err(err.into());
+            }
+            Err(err @ IndexationError::CoinBalanceWouldUnderflow { .. })
+            | Err(err @ IndexationError::MessageBalanceWouldUnderflow { .. }) => {
+                // TODO[RC]: Balances overflow to be correctly handled. See: https://github.com/FuelLabs/fuel-core/issues/2428
+                tracing::error!("Balances underflow detected: {}", err);
+            }
+        }
+
         match event.deref() {
             Event::MessageImported(message) => {
                 block_st_transaction
@@ -453,8 +499,12 @@ where
             graphql_metrics().total_txs_count.set(total_tx_count as i64);
         }
 
+        let balances_enabled = self.off_chain_database.balances_enabled()?;
+        tracing::info!("Balances cache available: {}", balances_enabled);
+
         let InitializeTask {
             chain_id,
+            da_compression_config,
             tx_pool,
             block_importer,
             blocks_events,
@@ -468,7 +518,9 @@ where
             block_importer: blocks_events,
             database: off_chain_database,
             chain_id,
+            da_compression_config,
             continue_on_error,
+            balances_enabled,
         };
 
         let mut target_chain_height = on_chain_database.latest_height()?;
@@ -514,6 +566,11 @@ where
         let next_block_height =
             off_chain_height.map(|height| BlockHeight::new(height.saturating_add(1)));
 
+        let next_block_height = match next_block_height {
+            Some(block_height) => BlockAt::Specific(block_height),
+            None => BlockAt::Genesis,
+        };
+
         let import_result =
             import_result_provider.block_event_at_height(next_block_height)?;
 
@@ -529,13 +586,12 @@ where
     TxPool: ports::worker::TxPool,
     D: ports::worker::OffChainDatabase,
 {
-    async fn run(&mut self, watcher: &mut StateWatcher) -> anyhow::Result<bool> {
-        let should_continue;
+    async fn run(&mut self, watcher: &mut StateWatcher) -> TaskNextAction {
         tokio::select! {
             biased;
 
             _ = watcher.while_started() => {
-                should_continue = false;
+                TaskNextAction::Stop
             }
 
             result = self.block_importer.next() => {
@@ -545,17 +601,19 @@ where
                     // In the case of an error, shut down the service to avoid a huge
                     // de-synchronization between on-chain and off-chain databases.
                     if let Err(e) = result {
-                        tracing::error!("Error processing block: {:?}", e);
-                        should_continue = self.continue_on_error;
+                        if self.continue_on_error {
+                            TaskNextAction::ErrorContinue(e)
+                        } else {
+                            TaskNextAction::Stop
+                        }
                     } else {
-                        should_continue = true
+                        TaskNextAction::Continue
                     }
                 } else {
-                    should_continue = false
+                    TaskNextAction::Stop
                 }
             }
         }
-        Ok(should_continue)
     }
 
     async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -579,6 +637,7 @@ pub fn new_service<TxPool, BlockImporter, OnChain, OffChain>(
     on_chain_database: OnChain,
     off_chain_database: OffChain,
     chain_id: ChainId,
+    da_compression_config: DaCompressionConfig,
     continue_on_error: bool,
 ) -> ServiceRunner<InitializeTask<TxPool, BlockImporter, OnChain, OffChain>>
 where
@@ -594,6 +653,7 @@ where
         on_chain_database,
         off_chain_database,
         chain_id,
+        da_compression_config,
         continue_on_error,
     })
 }

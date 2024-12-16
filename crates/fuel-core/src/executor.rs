@@ -3,20 +3,13 @@
 #[allow(non_snake_case)]
 #[cfg(test)]
 mod tests {
-
-    use std::sync::Mutex;
-
     use crate as fuel_core;
     use fuel_core::database::Database;
     use fuel_core_executor::{
-        executor::{
-            OnceTransactionsSource,
-            MAX_TX_COUNT,
-        },
+        executor::OnceTransactionsSource,
         ports::{
             MaybeCheckedTransaction,
             RelayerPort,
-            TransactionsSource,
         },
         refs::ContractRef,
     };
@@ -127,6 +120,7 @@ mod tests {
                 ExecutableTransaction,
                 MemoryInstance,
             },
+            predicate::EmptyStorage,
             script_with_data_offset,
             util::test_helpers::TestBuilder as TxBuilder,
             Call,
@@ -184,32 +178,6 @@ mod tests {
 
         fn latest_view(&self) -> StorageResult<Self::LatestView> {
             Ok(self.clone())
-        }
-    }
-
-    /// Bad transaction source: ignores the limit of `u16::MAX -1` transactions
-    /// that should be returned by [`TransactionsSource::next()`].
-    /// It is used only for testing purposes
-    pub struct BadTransactionsSource {
-        transactions: Mutex<Vec<MaybeCheckedTransaction>>,
-    }
-
-    impl BadTransactionsSource {
-        pub fn new(transactions: Vec<Transaction>) -> Self {
-            Self {
-                transactions: Mutex::new(
-                    transactions
-                        .into_iter()
-                        .map(MaybeCheckedTransaction::Transaction)
-                        .collect(),
-                ),
-            }
-        }
-    }
-
-    impl TransactionsSource for BadTransactionsSource {
-        fn next(&self, _: u64, _: u16, _: u32) -> Vec<MaybeCheckedTransaction> {
-            std::mem::take(&mut *self.transactions.lock().unwrap())
         }
     }
 
@@ -639,6 +607,7 @@ mod tests {
                 .next()
                 .unwrap()
                 .unwrap();
+
             assert_eq!(asset_id, AssetId::zeroed());
             assert_eq!(amount, expected_fee_amount_1 + expected_fee_amount_2);
         }
@@ -1502,9 +1471,10 @@ mod tests {
         }
         let mut config: Config = Default::default();
         // Each TX consumes `tx_gas_usage` gas and so set the block gas limit to execute only 9 transactions.
+        let block_gas_limit = tx_gas_usage * 9;
         config
             .consensus_parameters
-            .set_block_gas_limit(tx_gas_usage * 9);
+            .set_block_gas_limit(block_gas_limit);
         let mut executor = create_executor(Default::default(), config);
 
         let block = PartialFuelBlock {
@@ -1520,7 +1490,14 @@ mod tests {
 
         // Then
         assert_eq!(skipped_transactions.len(), 1);
-        assert_eq!(skipped_transactions[0].1, ExecutorError::GasOverflow);
+        assert_eq!(
+            skipped_transactions[0].1,
+            ExecutorError::GasOverflow(
+                "Transaction cannot fit in remaining gas limit: (0).".into(),
+                *tx_gas_usage,
+                0
+            )
+        );
     }
 
     #[test]
@@ -2592,7 +2569,6 @@ mod tests {
         // One of two transactions is skipped.
         assert_eq!(skipped_transactions.len(), 1);
         let err = &skipped_transactions[0].1;
-        dbg!(err);
         assert!(matches!(
             err,
             &ExecutorError::TransactionValidity(
@@ -2886,6 +2862,7 @@ mod tests {
         tx.estimate_predicates(
             &consensus_parameters.clone().into(),
             MemoryInstance::new(),
+            &EmptyStorage,
         )
         .unwrap();
         let db = &mut Database::default();
@@ -2954,6 +2931,7 @@ mod tests {
         tx.estimate_predicates(
             &cheap_consensus_parameters.clone().into(),
             MemoryInstance::new(),
+            &EmptyStorage,
         )
         .unwrap();
 
@@ -3017,14 +2995,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "wasm-executor"))]
     fn block_producer_never_includes_more_than_max_tx_count_transactions() {
+        use fuel_core_executor::executor::max_tx_count;
+
         let block_height = 1u32;
         let block_da_height = 2u64;
 
         let mut consensus_parameters = ConsensusParameters::default();
 
         // Given
-        let transactions_in_tx_source = (MAX_TX_COUNT as usize) + 10;
+        let transactions_in_tx_source = (max_tx_count() as usize) + 10;
         consensus_parameters.set_block_gas_limit(u64::MAX);
         let config = Config {
             consensus_parameters,
@@ -3048,20 +3029,50 @@ mod tests {
         // Then
         assert_eq!(
             result.block.transactions().len(),
-            (MAX_TX_COUNT as usize + 1)
+            (max_tx_count() as usize + 1)
         );
     }
 
     #[test]
+    #[cfg(not(feature = "wasm-executor"))]
     fn block_producer_never_includes_more_than_max_tx_count_transactions_with_bad_tx_source(
     ) {
+        use fuel_core_executor::executor::max_tx_count;
+        use std::sync::Mutex;
+
+        /// Bad transaction source: ignores the limit of `u16::MAX -1` transactions
+        /// that should be returned by [`TransactionsSource::next()`].
+        /// It is used only for testing purposes
+        pub struct BadTransactionsSource {
+            transactions: Mutex<Vec<MaybeCheckedTransaction>>,
+        }
+
+        impl BadTransactionsSource {
+            pub fn new(transactions: Vec<Transaction>) -> Self {
+                Self {
+                    transactions: Mutex::new(
+                        transactions
+                            .into_iter()
+                            .map(MaybeCheckedTransaction::Transaction)
+                            .collect(),
+                    ),
+                }
+            }
+        }
+
+        impl fuel_core_executor::ports::TransactionsSource for BadTransactionsSource {
+            fn next(&self, _: u64, _: u16, _: u32) -> Vec<MaybeCheckedTransaction> {
+                std::mem::take(&mut *self.transactions.lock().unwrap())
+            }
+        }
+
         let block_height = 1u32;
         let block_da_height = 2u64;
 
         let mut consensus_parameters = ConsensusParameters::default();
 
         // Given
-        let transactions_in_tx_source = (MAX_TX_COUNT as usize) + 10;
+        let transactions_in_tx_source = (max_tx_count() as usize) + 10;
         consensus_parameters.set_block_gas_limit(u64::MAX);
         let config = Config {
             consensus_parameters,
@@ -3093,23 +3104,24 @@ mod tests {
         // Then
         assert_eq!(
             result.block.transactions().len(),
-            (MAX_TX_COUNT as usize + 1)
+            (max_tx_count() as usize + 1)
         );
     }
 
     #[cfg(feature = "relayer")]
     mod relayer {
         use super::*;
-        use crate::{
-            database::database_description::{
-                on_chain::OnChain,
-                relayer::Relayer,
-            },
-            state::ChangesIterator,
+        use crate::database::database_description::{
+            on_chain::OnChain,
+            relayer::Relayer,
         };
         use fuel_core_relayer::storage::EventsHistory;
         use fuel_core_storage::{
-            iter::IteratorOverTable,
+            column::Column,
+            iter::{
+                changes_iterator::ChangesIterator,
+                IteratorOverTable,
+            },
             tables::FuelBlocks,
             StorageAsMut,
         };
@@ -3254,7 +3266,7 @@ mod tests {
             let (result, changes) = producer.produce_without_commit(block.into())?.into();
 
             // Then
-            let view = ChangesIterator::<OnChain>::new(&changes);
+            let view = ChangesIterator::<Column>::new(&changes);
             assert_eq!(
                 view.iter_all::<Messages>(None).count() as u64,
                 block_da_height - genesis_da_height
@@ -3863,7 +3875,7 @@ mod tests {
                 .into();
 
             // Then
-            let view = ChangesIterator::<OnChain>::new(&changes);
+            let view = ChangesIterator::<Column>::new(&changes);
             assert!(result.skipped_transactions.is_empty());
             assert_eq!(view.iter_all::<Messages>(None).count() as u64, 0);
         }
@@ -3905,7 +3917,7 @@ mod tests {
                 .into();
 
             // Then
-            let view = ChangesIterator::<OnChain>::new(&changes);
+            let view = ChangesIterator::<Column>::new(&changes);
             assert!(result.skipped_transactions.is_empty());
             assert_eq!(view.iter_all::<Messages>(None).count() as u64, 0);
             assert_eq!(result.events.len(), 2);

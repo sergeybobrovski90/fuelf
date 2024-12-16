@@ -44,16 +44,25 @@ use crate::{
     StorageSize,
     StorageWrite,
 };
-use core::ops::Deref;
 
 #[cfg(feature = "std")]
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    fmt::Debug,
+};
 
 #[cfg(not(feature = "std"))]
-use alloc::borrow::Cow;
+use alloc::{
+    borrow::Cow,
+    fmt::Debug,
+};
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+use fuel_vm_private::storage::{
+    predicate::PredicateStorageRequirements,
+    BlobData,
+};
 
 pub mod balances;
 pub mod blobs;
@@ -95,7 +104,7 @@ impl<S> StructuredStorage<S> {
     }
 
     /// Returns the inner storage.
-    pub fn into_inner(self) -> S {
+    pub fn into_storage(self) -> S {
         self.inner
     }
 }
@@ -141,6 +150,16 @@ where
         buf: &mut [u8],
     ) -> StorageResult<Option<usize>> {
         self.inner.read(key, column, buf)
+    }
+}
+
+impl<S> PredicateStorageRequirements for StructuredStorage<S>
+where
+    Self: StorageRead<BlobData>,
+    Self::Error: Debug,
+{
+    fn storage_error_to_string(error: Self::Error) -> alloc::string::String {
+        alloc::format!("{:?}", error)
     }
 }
 
@@ -362,7 +381,7 @@ where
         self.inner
             .get(key_bytes.as_ref(), <M as TableWithBlueprint>::column())
             // TODO: Return `Value` instead of cloned `Vec<u8>`.
-            .map(|value| value.map(|value| value.deref().clone()))
+            .map(|value| value.map(|value| value.to_vec()))
     }
 }
 

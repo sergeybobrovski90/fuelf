@@ -16,7 +16,6 @@ use tokio::{
         Instant,
     },
 };
-use tokio_stream::StreamExt;
 
 use crate::{
     ports::{
@@ -37,15 +36,13 @@ use crate::{
     Trigger,
 };
 use fuel_core_services::{
-    stream::{
-        BoxFuture,
-        BoxStream,
-    },
+    stream::BoxFuture,
     RunnableService,
     RunnableTask,
     Service as OtherService,
     ServiceRunner,
     StateWatcher,
+    TaskNextAction,
 };
 use fuel_core_storage::transactional::Changes;
 use fuel_core_types::{
@@ -132,7 +129,7 @@ pub struct MainTask<T, B, I, S, PB, C> {
     block_producer: B,
     block_importer: I,
     txpool: T,
-    tx_status_update_stream: BoxStream<TxId>,
+    new_txs_watcher: tokio::sync::watch::Receiver<()>,
     request_receiver: mpsc::Receiver<Request>,
     shared_state: SharedState,
     last_height: BlockHeight,
@@ -164,7 +161,7 @@ where
         predefined_blocks: PB,
         clock: C,
     ) -> Self {
-        let tx_status_update_stream = txpool.transaction_status_events();
+        let new_txs_watcher = txpool.new_txs_watcher();
         let (request_sender, request_receiver) = mpsc::channel(1024);
         let (last_height, last_timestamp, last_block_created) =
             Self::extract_block_info(clock.now(), last_block);
@@ -194,7 +191,7 @@ where
             txpool,
             block_producer,
             block_importer,
-            tx_status_update_stream,
+            new_txs_watcher,
             request_receiver,
             shared_state: SharedState { request_sender },
             last_height,
@@ -343,16 +340,18 @@ where
             .await?
             .into();
 
-        let mut tx_ids_to_remove = Vec::with_capacity(skipped_transactions.len());
-        for (tx_id, err) in skipped_transactions {
-            tracing::error!(
+        if !skipped_transactions.is_empty() {
+            let mut tx_ids_to_remove = Vec::with_capacity(skipped_transactions.len());
+            for (tx_id, err) in skipped_transactions {
+                tracing::error!(
                 "During block production got invalid transaction {:?} with error {:?}",
                 tx_id,
                 err
             );
-            tx_ids_to_remove.push((tx_id, err));
+                tx_ids_to_remove.push((tx_id, err.to_string()));
+            }
+            self.txpool.notify_skipped_txs(tx_ids_to_remove);
         }
-        self.txpool.remove_txs(tx_ids_to_remove);
 
         // Sign the block and seal it
         let seal = self.signer.seal_block(&block).await?;
@@ -360,8 +359,6 @@ where
             entity: block,
             consensus: seal,
         };
-
-        block.entity.header().time();
 
         // Import the sealed block
         self.block_importer
@@ -438,16 +435,9 @@ where
         Ok(())
     }
 
-    pub(crate) async fn on_txpool_event(&mut self) -> anyhow::Result<()> {
+    async fn on_txpool_event(&mut self) -> anyhow::Result<()> {
         match self.trigger {
-            Trigger::Instant => {
-                let pending_number = self.txpool.pending_number();
-                // skip production if there are no pending transactions
-                if pending_number > 0 {
-                    self.produce_next_block().await?;
-                }
-                Ok(())
-            }
+            Trigger::Instant => self.produce_next_block().await,
             Trigger::Never | Trigger::Interval { .. } => Ok(()),
         }
     }
@@ -527,23 +517,16 @@ where
     PB: PredefinedBlocks,
     C: GetTime,
 {
-    async fn run(&mut self, watcher: &mut StateWatcher) -> anyhow::Result<bool> {
-        let should_continue;
+    async fn run(&mut self, watcher: &mut StateWatcher) -> TaskNextAction {
         let mut sync_state = self.sync_task_handle.shared.clone();
         // make sure we're synced first
-        while *sync_state.borrow_and_update() == SyncState::NotSynced {
+        if *sync_state.borrow_and_update() == SyncState::NotSynced {
             tokio::select! {
                 biased;
                 result = watcher.while_started() => {
-                    should_continue = result?.started();
-                    return Ok(should_continue);
+                    return result.map(|state| state.started()).into()
                 }
-                _ = sync_state.changed() => {
-                    break;
-                }
-                _ = self.tx_status_update_stream.next() => {
-                    // ignore txpool events while syncing
-                }
+                _ = sync_state.changed() => {}
             }
         }
 
@@ -552,26 +535,37 @@ where
         }
 
         let next_height = self.next_height();
-        let maybe_block = self.predefined_blocks.get_block(&next_height)?;
+        let maybe_block = match self.predefined_blocks.get_block(&next_height) {
+            Ok(option) => option,
+            Err(err) => return TaskNextAction::ErrorContinue(err),
+        };
         if let Some(block) = maybe_block {
-            self.produce_predefined_block(&block).await?;
-            should_continue = true;
-            return Ok(should_continue)
+            let res = self.produce_predefined_block(&block).await;
+            return match res {
+                Ok(()) => TaskNextAction::Continue,
+                Err(err) => TaskNextAction::ErrorContinue(err),
+            }
         }
 
         let next_block_production: BoxFuture<()> = match self.trigger {
             Trigger::Never | Trigger::Instant => Box::pin(core::future::pending()),
-            Trigger::Interval { block_time } => Box::pin(sleep_until(
-                self.last_block_created
+            Trigger::Interval { block_time } => {
+                let next_block_time = match self
+                    .last_block_created
                     .checked_add(block_time)
-                    .ok_or(anyhow!("Time exceeds system limits"))?,
-            )),
+                    .ok_or(anyhow!("Time exceeds system limits"))
+                {
+                    Ok(time) => time,
+                    Err(err) => return TaskNextAction::ErrorContinue(err),
+                };
+                Box::pin(sleep_until(next_block_time))
+            }
         };
 
         tokio::select! {
             biased;
             _ = watcher.while_started() => {
-                should_continue = false;
+                TaskNextAction::Stop
             }
             request = self.request_receiver.recv() => {
                 if let Some(request) = request {
@@ -581,39 +575,27 @@ where
                             let _ = response.send(result);
                         }
                     }
-                    should_continue = true;
+                    TaskNextAction::Continue
                 } else {
                     tracing::error!("The PoA task should be the holder of the `Sender`");
-                    should_continue = false;
-                }
-            }
-            // TODO: This should likely be refactored to use something like tokio::sync::Notify.
-            //       Otherwise, if a bunch of txs are submitted at once and all the txs are included
-            //       into the first block production trigger, we'll still call the event handler
-            //       for each tx after they've already been included into a block.
-            //       The poa service also doesn't care about events unrelated to new tx submissions,
-            //       and shouldn't be awoken when txs are completed or squeezed out of the pool.
-            txpool_event = self.tx_status_update_stream.next() => {
-                if txpool_event.is_some()  {
-                    self.on_txpool_event().await.context("While processing txpool event")?;
-                    should_continue = true;
-                } else {
-                    should_continue = false;
+                    TaskNextAction::Stop
                 }
             }
             _ = next_block_production => {
                 match self.on_timer().await.context("While processing timer event") {
-                    Ok(()) => should_continue = true,
+                    Ok(()) => TaskNextAction::Continue,
                     Err(err) => {
                         // Wait some time in case of error to avoid spamming retry block production
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        return Err(err);
+                        TaskNextAction::ErrorContinue(err)
                     }
-                };
+                }
+            }
+            _ = self.new_txs_watcher.changed() => {
+                let res = self.on_txpool_event().await.context("While processing txpool event");
+                TaskNextAction::always_continue(res)
             }
         }
-
-        Ok(should_continue)
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {

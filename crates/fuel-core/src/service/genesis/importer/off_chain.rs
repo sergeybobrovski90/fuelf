@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::{
     database::{
         database_description::off_chain::OffChain,
@@ -38,11 +36,29 @@ use fuel_core_storage::{
     StorageAsMut,
 };
 use fuel_core_types::services::executor::Event;
+use std::borrow::Cow;
 
 use super::{
     import_task::ImportTable,
     Handler,
 };
+
+fn balances_indexation_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static BALANCES_INDEXATION_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *BALANCES_INDEXATION_ENABLED.get_or_init(|| {
+        // During re-genesis process the metadata is always doesn't exist.
+        let metadata = None;
+        let indexation_availability =
+            crate::database::database_description::indexation_availability::<OffChain>(
+                metadata,
+            );
+        indexation_availability
+            .contains(&crate::database::database_description::IndexationKind::Balances)
+    })
+}
 
 impl ImportTable for Handler<TransactionStatuses, TransactionStatuses> {
     type TableInSnapshot = TransactionStatuses;
@@ -111,7 +127,11 @@ impl ImportTable for Handler<OwnedMessageIds, Messages> {
         let events = group
             .into_iter()
             .map(|TableEntry { value, .. }| Cow::Owned(Event::MessageImported(value)));
-        worker_service::process_executor_events(events, tx)?;
+        worker_service::process_executor_events(
+            events,
+            tx,
+            balances_indexation_enabled(),
+        )?;
         Ok(())
     }
 }
@@ -129,7 +149,29 @@ impl ImportTable for Handler<OwnedCoins, Coins> {
         let events = group.into_iter().map(|TableEntry { value, key }| {
             Cow::Owned(Event::CoinCreated(value.uncompress(key)))
         });
-        worker_service::process_executor_events(events, tx)?;
+        worker_service::process_executor_events(
+            events,
+            tx,
+            balances_indexation_enabled(),
+        )?;
+        Ok(())
+    }
+}
+
+impl ImportTable for Handler<ContractsInfo, ContractsInfo> {
+    type TableInSnapshot = ContractsInfo;
+    type TableBeingWritten = ContractsInfo;
+    type DbDesc = OffChain;
+
+    fn process(
+        &mut self,
+        group: Vec<TableEntry<Self::TableInSnapshot>>,
+        tx: &mut StorageTransaction<&mut GenesisDatabase<Self::DbDesc>>,
+    ) -> anyhow::Result<()> {
+        for entry in group {
+            tx.storage::<ContractsInfo>()
+                .insert(&entry.key, &entry.value)?;
+        }
         Ok(())
     }
 }

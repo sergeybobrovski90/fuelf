@@ -355,6 +355,7 @@ mod full_block {
         schema::{
             block::{
                 BlockByHeightArgs,
+                BlockByHeightArgsFields,
                 Consensus,
                 Header,
             },
@@ -365,7 +366,11 @@ mod full_block {
         },
         FuelClient,
     };
-    use fuel_core_executor::executor;
+    use fuel_core_executor::executor::max_tx_count;
+    use fuel_core_txpool::config::{
+        HeavyWorkConfig,
+        PoolLimits,
+    };
     use fuel_core_types::fuel_types::BlockHeight;
 
     #[derive(cynic::QueryFragment, Debug)]
@@ -438,8 +443,18 @@ mod full_block {
         let mut rng = StdRng::seed_from_u64(2322);
 
         let local_node_config = Config::local_node();
-        let txpool = fuel_core_txpool::Config {
-            max_tx: usize::MAX,
+        let txpool = fuel_core_txpool::config::Config {
+            pool_limits: PoolLimits {
+                max_txs: usize::MAX,
+                max_gas: u64::MAX,
+                max_bytes_size: usize::MAX,
+            },
+            heavy_work: HeavyWorkConfig {
+                number_threads_to_verify_transactions: 4,
+                number_threads_p2p_sync: 0,
+                size_of_verification_queue: u16::MAX as usize,
+                size_of_p2p_sync_queue: 1,
+            },
             ..local_node_config.txpool
         };
         let chain_config = local_node_config.snapshot_reader.chain_config().clone();
@@ -465,7 +480,7 @@ mod full_block {
         let srv = FuelService::new_node(patched_node_config).await.unwrap();
         let client = FuelClient::from(srv.bound_address);
 
-        let tx_count: u64 = 66_000;
+        let tx_count: u64 = max_tx_count() as u64 + 100;
         let txs = (1..=tx_count)
             .map(|i| test_helpers::make_tx(&mut rng, i, max_gas_limit))
             .collect_vec();
@@ -491,11 +506,11 @@ mod full_block {
 
         assert_eq!(
             second_last_block.transactions.len(),
-            executor::MAX_TX_COUNT as usize + 1 // Mint transaction for one block
+            max_tx_count() as usize + 1 // Mint transaction for one block
         );
         assert_eq!(
             last_block.transactions.len(),
-            (tx_count as usize - (executor::MAX_TX_COUNT as usize)) + 1 /* Mint transaction for second block */
+            (tx_count as usize - (max_tx_count() as usize)) + 1 /* Mint transaction for second block */
         );
     }
 }

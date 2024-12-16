@@ -11,9 +11,11 @@ use crate::{
             P2pPort,
             TxPoolPort,
         },
+        validation_extension::ValidationExtension,
         view_extension::ViewExtension,
         Config,
     },
+    graphql_api,
     schema::{
         CoreSchema,
         CoreSchemaBuilder,
@@ -24,10 +26,7 @@ use crate::{
     },
 };
 use async_graphql::{
-    http::{
-        playground_source,
-        GraphQLPlaygroundConfig,
-    },
+    http::GraphiQLSource,
     Request,
     Response,
 };
@@ -58,13 +57,16 @@ use axum::{
     Router,
 };
 use fuel_core_services::{
+    AsyncProcessor,
     RunnableService,
     RunnableTask,
     StateWatcher,
+    TaskNextAction,
 };
 use fuel_core_storage::transactional::AtomicView;
 use fuel_core_types::fuel_types::BlockHeight;
 use futures::Stream;
+use hyper::rt::Executor;
 use serde_json::json;
 use std::{
     future::Future,
@@ -73,8 +75,10 @@ use std::{
         TcpListener,
     },
     pin::Pin,
+    sync::Arc,
 };
 use tokio_stream::StreamExt;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
     set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
@@ -84,6 +88,7 @@ use tower_http::{
 pub type Service = fuel_core_services::ServiceRunner<GraphqlService>;
 
 pub use super::database::ReadDatabase;
+use super::ports::worker;
 
 pub type BlockProducer = Box<dyn BlockProducerPort>;
 // In the future GraphQL should not be aware of `TxPool`. It should
@@ -108,11 +113,31 @@ pub struct GraphqlService {
 pub struct ServerParams {
     router: Router,
     listener: TcpListener,
+    number_of_threads: usize,
 }
 
 pub struct Task {
     // Ugly workaround because of https://github.com/hyperium/hyper/issues/2582
     server: Pin<Box<dyn Future<Output = hyper::Result<()>> + Send + 'static>>,
+}
+
+#[derive(Clone)]
+struct ExecutorWithMetrics {
+    processor: Arc<AsyncProcessor>,
+}
+
+impl<F> Executor<F> for ExecutorWithMetrics
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        let result = self.processor.try_spawn(fut);
+
+        if let Err(err) = result {
+            tracing::error!("Failed to spawn a task for GraphQL: {:?}", err);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -135,10 +160,25 @@ impl RunnableService for GraphqlService {
         params: Self::TaskParams,
     ) -> anyhow::Result<Self::Task> {
         let mut state = state.clone();
-        let ServerParams { router, listener } = params;
+        let ServerParams {
+            router,
+            listener,
+            number_of_threads,
+        } = params;
+
+        let processor = AsyncProcessor::new(
+            "GraphQLFutures",
+            number_of_threads,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )?;
+
+        let executor = ExecutorWithMetrics {
+            processor: Arc::new(processor),
+        };
 
         let server = axum::Server::from_tcp(listener)
             .unwrap()
+            .executor(executor)
             .serve(router.into_make_service())
             .with_graceful_shutdown(async move {
                 state
@@ -155,11 +195,15 @@ impl RunnableService for GraphqlService {
 
 #[async_trait::async_trait]
 impl RunnableTask for Task {
-    async fn run(&mut self, _: &mut StateWatcher) -> anyhow::Result<bool> {
-        self.server.as_mut().await?;
-        // The `axum::Server` has its internal loop. If `await` is finished, we get an internal
-        // error or stop signal.
-        Ok(false /* should_continue */)
+    async fn run(&mut self, _: &mut StateWatcher) -> TaskNextAction {
+        match self.server.as_mut().await {
+            Ok(()) => {
+                // The `axum::Server` has its internal loop. If `await` is finished, we get an internal
+                // error or stop signal.
+                TaskNextAction::Stop
+            }
+            Err(err) => TaskNextAction::ErrorContinue(err.into()),
+        }
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {
@@ -188,20 +232,31 @@ pub fn new_service<OnChain, OffChain>(
 ) -> anyhow::Result<Service>
 where
     OnChain: AtomicView + 'static,
-    OffChain: AtomicView + 'static,
+    OffChain: AtomicView + worker::OffChainDatabase + 'static,
     OnChain::LatestView: OnChainDatabase,
     OffChain::LatestView: OffChainDatabase,
 {
+    graphql_api::initialize_query_costs(config.config.costs.clone())?;
+
     let network_addr = config.config.addr;
-    let combined_read_database =
-        ReadDatabase::new(genesis_block_height, on_database, off_database);
+    let combined_read_database = ReadDatabase::new(
+        config.config.database_batch_size,
+        genesis_block_height,
+        on_database,
+        off_database,
+    )?;
     let request_timeout = config.config.api_request_timeout;
+    let concurrency_limit = config.config.max_concurrent_queries;
     let body_limit = config.config.request_body_bytes_limit;
+    let max_queries_resolver_recursive_depth =
+        config.config.max_queries_resolver_recursive_depth;
+    let number_of_threads = config.config.number_of_threads;
 
     let schema = schema
         .limit_complexity(config.config.max_queries_complexity)
         .limit_depth(config.config.max_queries_depth)
         .limit_recursive_depth(config.config.max_queries_recursive_depth)
+        .limit_directives(config.config.max_queries_directives)
         .extension(MetricsExtension::new(
             config.config.query_log_threshold_time,
         ))
@@ -214,15 +269,29 @@ where
         .data(gas_price_provider)
         .data(consensus_parameters_provider)
         .data(memory_pool)
+        .extension(ValidationExtension::new(
+            max_queries_resolver_recursive_depth,
+        ))
         .extension(async_graphql::extensions::Tracing)
         .extension(ViewExtension::new())
         .finish();
 
+    let graphql_endpoint = "/v1/graphql";
+    let graphql_subscription_endpoint = "/v1/graphql-sub";
+
+    let graphql_playground =
+        || render_graphql_playground(graphql_endpoint, graphql_subscription_endpoint);
+
     let router = Router::new()
         .route("/v1/playground", get(graphql_playground))
-        .route("/v1/graphql", post(graphql_handler).options(ok))
         .route(
-            "/v1/graphql-sub",
+            graphql_endpoint,
+            post(graphql_handler)
+                .layer(ConcurrencyLimitLayer::new(concurrency_limit))
+                .options(ok),
+        )
+        .route(
+            graphql_subscription_endpoint,
             post(graphql_subscription_handler).options(ok),
         )
         .route("/v1/metrics", get(metrics))
@@ -252,14 +321,25 @@ where
 
     Ok(Service::new_with_params(
         GraphqlService { bound_address },
-        ServerParams { router, listener },
+        ServerParams {
+            router,
+            listener,
+            number_of_threads,
+        },
     ))
 }
 
-async fn graphql_playground() -> impl IntoResponse {
-    Html(playground_source(GraphQLPlaygroundConfig::new(
-        "/v1/graphql",
-    )))
+async fn render_graphql_playground(
+    endpoint: &str,
+    subscription_endpoint: &str,
+) -> impl IntoResponse {
+    Html(
+        GraphiQLSource::build()
+            .endpoint(endpoint)
+            .subscription_endpoint(subscription_endpoint)
+            .title("Fuel Graphql Playground")
+            .finish(),
+    )
 }
 
 async fn health() -> Json<serde_json::Value> {

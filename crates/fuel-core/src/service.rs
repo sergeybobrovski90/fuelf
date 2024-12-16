@@ -27,6 +27,7 @@ use fuel_core_services::{
     ServiceRunner,
     State,
     StateWatcher,
+    TaskNextAction,
 };
 use fuel_core_storage::{
     not_found,
@@ -333,6 +334,14 @@ impl FuelService {
             }
         }
 
+        // repopulate missing tables
+        genesis::recover_missing_tables_from_genesis_state_config(
+            watcher.clone(),
+            &self.shared.config,
+            &self.shared.database,
+        )
+        .await?;
+
         self.override_chain_config_if_needed()
     }
 }
@@ -420,7 +429,7 @@ impl RunnableService for Task {
 #[async_trait::async_trait]
 impl RunnableTask for Task {
     #[tracing::instrument(skip_all)]
-    async fn run(&mut self, watcher: &mut StateWatcher) -> anyhow::Result<bool> {
+    async fn run(&mut self, watcher: &mut StateWatcher) -> TaskNextAction {
         let mut stop_signals = vec![];
         for service in self.services.iter() {
             stop_signals.push(service.await_stop())
@@ -435,8 +444,7 @@ impl RunnableTask for Task {
 
         // We received the stop signal from any of one source, so stop this service and
         // all sub-services.
-        let should_continue = false;
-        Ok(should_continue)
+        TaskNextAction::Stop
     }
 
     async fn shutdown(self) -> anyhow::Result<()> {

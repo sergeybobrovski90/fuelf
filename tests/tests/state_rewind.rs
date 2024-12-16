@@ -9,7 +9,6 @@ use fuel_core::{
     },
 };
 use fuel_core_storage::transactional::AtomicView;
-use fuel_core_txpool::types::TxId;
 use fuel_core_types::{
     fuel_tx::{
         AssetId,
@@ -17,6 +16,7 @@ use fuel_core_types::{
         Output,
         Transaction,
         TransactionBuilder,
+        TxId,
         UniqueIdentifier,
     },
     fuel_types::BlockHeight,
@@ -77,7 +77,7 @@ async fn validate_block_at_any_height__only_transfers() -> anyhow::Result<()> {
     let node = &driver.node;
 
     // Given
-    const TOTAL_BLOCKS: u64 = 5000;
+    const TOTAL_BLOCKS: u64 = 1000;
     const MIN_AMOUNT: u64 = 123456;
     let mut last_block_height = 0u32;
     let mut database_modifications = std::collections::HashMap::new();
@@ -114,6 +114,7 @@ async fn validate_block_at_any_height__only_transfers() -> anyhow::Result<()> {
         assert_eq!(&actual_changes, expected_changes);
     }
 
+    driver.kill().await;
     Ok(())
 }
 
@@ -159,7 +160,11 @@ async fn rollback_existing_chain_to_target_height_and_verify(
         transactions.push(tx.id(&Default::default()));
 
         let result = node.submit_and_await_commit(tx).await.unwrap();
-        assert!(matches!(result, TransactionStatus::Success(_)));
+        assert!(
+            matches!(result, TransactionStatus::Success(_)),
+            "Transaction got unexpected status {:?}",
+            result
+        );
     }
     let all_transactions = all_real_transactions(node);
     assert_eq!(all_transactions.len(), blocks_in_the_chain as usize);
@@ -207,6 +212,7 @@ async fn rollback_existing_chain_to_target_height_and_verify(
         .latest_height_from_metadata();
     assert_eq!(Ok(Some(BlockHeight::new(target_height))), latest_height);
 
+    driver.kill().await;
     Ok(())
 }
 

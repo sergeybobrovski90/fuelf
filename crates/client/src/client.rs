@@ -1,3 +1,5 @@
+#[cfg(feature = "subscriptions")]
+use crate::client::types::StatusWithTransaction;
 use crate::client::{
     schema::{
         block::BlockByHeightArgs,
@@ -28,6 +30,11 @@ use crate::client::{
     },
 };
 use anyhow::Context;
+#[cfg(feature = "subscriptions")]
+use base64::prelude::{
+    Engine as _,
+    BASE64_STANDARD,
+};
 #[cfg(feature = "subscriptions")]
 use cynic::StreamingOperation;
 use cynic::{
@@ -74,9 +81,18 @@ use schema::{
     balance::BalanceArgs,
     blob::BlobByIdArgs,
     block::BlockByIdArgs,
-    coins::CoinByIdArgs,
-    contract::ContractByIdArgs,
+    coins::{
+        CoinByIdArgs,
+        CoinsConnectionArgs,
+    },
+    contract::{
+        ContractBalancesConnectionArgs,
+        ContractByIdArgs,
+    },
+    da_compressed::DaCompressedBlockByHeightArgs,
+    gas_price::BlockHorizonArgs,
     tx::{
+        TransactionsByOwnerConnectionArgs,
         TxArg,
         TxIdArgs,
     },
@@ -270,6 +286,19 @@ impl FuelClient {
                     format!("Failed to add header to client {e:?}"),
                 )
             })?;
+        if let Some(password) = url.password() {
+            let username = url.username();
+            let credentials = format!("{}:{}", username, password);
+            let authorization = format!("Basic {}", BASE64_STANDARD.encode(credentials));
+            client_builder = client_builder
+                .header("Authorization", &authorization)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to add header to client {e:?}"),
+                    )
+                })?;
+        }
 
         if let Some(value) = self.cookie.deref().cookies(&self.url) {
             let value = value.to_str().map_err(|e| {
@@ -366,7 +395,10 @@ impl FuelClient {
         &self,
         block_horizon: u32,
     ) -> io::Result<EstimateGasPrice> {
-        let query = schema::gas_price::QueryEstimateGasPrice::build(block_horizon.into());
+        let args = BlockHorizonArgs {
+            block_horizon: Some(block_horizon.into()),
+        };
+        let query = schema::gas_price::QueryEstimateGasPrice::build(args);
         self.query(query).await.map(|r| r.estimate_gas_price)
     }
 
@@ -518,6 +550,33 @@ impl FuelClient {
         let mut stream = self.subscribe(s).await?.map(
             |r: io::Result<schema::tx::SubmitAndAwaitSubscription>| {
                 let status: TransactionStatus = r?.submit_and_await.try_into()?;
+                Result::<_, io::Error>::Ok(status)
+            },
+        );
+
+        let status = stream.next().await.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to get status from the submission",
+        ))??;
+
+        Ok(status)
+    }
+
+    /// Similar to [`Self::submit_and_await_commit`], but the status also contains transaction.
+    #[cfg(feature = "subscriptions")]
+    pub async fn submit_and_await_commit_with_tx(
+        &self,
+        tx: &Transaction,
+    ) -> io::Result<StatusWithTransaction> {
+        use cynic::SubscriptionBuilder;
+        let tx = tx.clone().to_bytes();
+        let s = schema::tx::SubmitAndAwaitSubscriptionWithTransaction::build(TxArg {
+            tx: HexString(Bytes(tx)),
+        });
+
+        let mut stream = self.subscribe(s).await?.map(
+            |r: io::Result<schema::tx::SubmitAndAwaitSubscriptionWithTransaction>| {
+                let status: StatusWithTransaction = r?.submit_and_await.try_into()?;
                 Result::<_, io::Error>::Ok(status)
             },
         );
@@ -750,7 +809,8 @@ impl FuelClient {
         &self,
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<TransactionResponse, String>> {
-        let query = schema::tx::TransactionsQuery::build(request.into());
+        let args = schema::ConnectionArgs::from(request);
+        let query = schema::tx::TransactionsQuery::build(args);
         let transactions = self.query(query).await?.transactions.try_into()?;
         Ok(transactions)
     }
@@ -762,7 +822,8 @@ impl FuelClient {
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<TransactionResponse, String>> {
         let owner: schema::Address = (*owner).into();
-        let query = schema::tx::TransactionsByOwnerQuery::build((owner, request).into());
+        let args = TransactionsByOwnerConnectionArgs::from((owner, request));
+        let query = schema::tx::TransactionsByOwnerQuery::build(args);
 
         let transactions = self.query(query).await?.transactions_by_owner.try_into()?;
         Ok(transactions)
@@ -862,6 +923,23 @@ impl FuelClient {
         Ok(block)
     }
 
+    pub async fn da_compressed_block(
+        &self,
+        height: BlockHeight,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let query = schema::da_compressed::DaCompressedBlockByHeightQuery::build(
+            DaCompressedBlockByHeightArgs {
+                height: U32(height.into()),
+            },
+        );
+
+        Ok(self
+            .query(query)
+            .await?
+            .da_compressed_block
+            .map(|b| b.bytes.into()))
+    }
+
     /// Retrieve a blob by its ID
     pub async fn blob(&self, id: BlobId) -> io::Result<Option<types::Blob>> {
         let query = schema::blob::BlobByIdQuery::build(BlobByIdArgs { id: id.into() });
@@ -869,12 +947,19 @@ impl FuelClient {
         Ok(blob)
     }
 
+    /// Check whether a blob with ID exists
+    pub async fn blob_exists(&self, id: BlobId) -> io::Result<bool> {
+        let query = schema::blob::BlobExistsQuery::build(BlobByIdArgs { id: id.into() });
+        Ok(self.query(query).await?.blob.is_some())
+    }
+
     /// Retrieve multiple blocks
     pub async fn blocks(
         &self,
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<types::Block, String>> {
-        let query = schema::block::BlocksQuery::build(request.into());
+        let args = schema::ConnectionArgs::from(request);
+        let query = schema::block::BlocksQuery::build(args);
 
         let blocks = self.query(query).await?.blocks.try_into()?;
 
@@ -901,7 +986,8 @@ impl FuelClient {
             Some(asset_id) => (*asset_id).into(),
             None => schema::AssetId::default(),
         };
-        let query = schema::coins::CoinsQuery::build((owner, asset_id, request).into());
+        let args = CoinsConnectionArgs::from((owner, asset_id, request));
+        let query = schema::coins::CoinsQuery::build(args);
 
         let coins = self.query(query).await?.coins.into();
         Ok(coins)
@@ -936,9 +1022,9 @@ impl FuelClient {
                 },
             )
             .map(Into::into);
-        let query = schema::coins::CoinsToSpendQuery::build(
-            (owner, spend_query, excluded_ids).into(),
-        );
+        let args =
+            schema::coins::CoinsToSpendArgs::from((owner, spend_query, excluded_ids));
+        let query = schema::coins::CoinsToSpendQuery::build(args);
 
         let coins_per_asset = self
             .query(query)
@@ -991,7 +1077,7 @@ impl FuelClient {
         };
         let query = schema::balance::BalanceQuery::build(BalanceArgs { owner, asset_id });
         let balance: types::Balance = self.query(query).await?.balance.into();
-        Ok(balance.amount)
+        Ok(balance.amount.try_into().unwrap_or(u64::MAX))
     }
 
     // Retrieve a page of balances by their owner
@@ -1001,7 +1087,8 @@ impl FuelClient {
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<types::Balance, String>> {
         let owner: schema::Address = (*owner).into();
-        let query = schema::balance::BalancesQuery::build((owner, request).into());
+        let args = schema::balance::BalancesConnectionArgs::from((owner, request));
+        let query = schema::balance::BalancesQuery::build(args);
 
         let balances = self.query(query).await?.balances.into();
         Ok(balances)
@@ -1013,8 +1100,8 @@ impl FuelClient {
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<types::ContractBalance, String>> {
         let contract_id: schema::ContractId = (*contract).into();
-        let query =
-            schema::contract::ContractBalancesQuery::build((contract_id, request).into());
+        let args = ContractBalancesConnectionArgs::from((contract_id, request));
+        let query = schema::contract::ContractBalancesQuery::build(args);
 
         let balances = self.query(query).await?.contract_balances.into();
 
@@ -1036,11 +1123,23 @@ impl FuelClient {
         request: PaginationRequest<String>,
     ) -> io::Result<PaginatedResult<types::Message, String>> {
         let owner: Option<schema::Address> = owner.map(|owner| (*owner).into());
-        let query = schema::message::OwnedMessageQuery::build((owner, request).into());
+        let args = schema::message::OwnedMessagesConnectionArgs::from((owner, request));
+        let query = schema::message::OwnedMessageQuery::build(args);
 
         let messages = self.query(query).await?.messages.into();
 
         Ok(messages)
+    }
+
+    pub async fn contract_info(
+        &self,
+        contract: &ContractId,
+    ) -> io::Result<Option<types::Contract>> {
+        let query = schema::contract::ContractByIdQuery::build(ContractByIdArgs {
+            id: (*contract).into(),
+        });
+        let contract_info = self.query(query).await?.contract.map(Into::into);
+        Ok(contract_info)
     }
 
     pub async fn message_status(&self, nonce: &Nonce) -> io::Result<MessageStatus> {
@@ -1059,7 +1158,7 @@ impl FuelClient {
         nonce: &Nonce,
         commit_block_id: Option<&BlockId>,
         commit_block_height: Option<BlockHeight>,
-    ) -> io::Result<Option<types::MessageProof>> {
+    ) -> io::Result<types::MessageProof> {
         let transaction_id: TransactionId = (*transaction_id).into();
         let nonce: schema::Nonce = (*nonce).into();
         let commit_block_id: Option<schema::BlockId> =
@@ -1071,14 +1170,7 @@ impl FuelClient {
             commit_block_id,
             commit_block_height,
         });
-
-        let proof = self
-            .query(query)
-            .await?
-            .message_proof
-            .map(TryInto::try_into)
-            .transpose()?;
-
+        let proof = self.query(query).await?.message_proof.try_into()?;
         Ok(proof)
     }
 
@@ -1106,7 +1198,7 @@ impl FuelClient {
     pub async fn transparent_transaction(
         &self,
         id: &TxId,
-    ) -> io::Result<Option<Transaction>> {
+    ) -> io::Result<Option<types::TransactionType>> {
         let query = schema::tx::TransactionQuery::build(TxIdArgs { id: (*id).into() });
 
         let transaction = self.query(query).await?.transaction;

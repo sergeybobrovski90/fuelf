@@ -504,6 +504,7 @@ impl TryFrom<VmBench> for VmBenchPrepared {
         tx.estimate_predicates(
             &CheckPredicateParams::from(&params),
             MemoryInstance::new(),
+            db.database_mut(),
         )
         .unwrap();
         let tx = tx.into_checked(height, &params).unwrap();

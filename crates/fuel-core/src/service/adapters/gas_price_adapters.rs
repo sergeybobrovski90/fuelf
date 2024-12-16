@@ -3,13 +3,15 @@ use crate::{
     service::adapters::ConsensusParametersProvider,
 };
 use fuel_core_gas_price_service::{
-    fuel_gas_price_updater::{
+    common::{
         fuel_core_storage_adapter::{
             GasPriceSettings,
             GasPriceSettingsProvider,
         },
-        Error as GasPriceError,
-        Result as GasPriceResult,
+        utils::{
+            Error as GasPriceError,
+            Result as GasPriceResult,
+        },
     },
     ports::{
         GasPriceData,
@@ -62,9 +64,9 @@ impl GasPriceData for Database<GasPriceDatabase> {
 
 impl From<Config> for GasPriceServiceConfig {
     fn from(value: Config) -> Self {
-        GasPriceServiceConfig::new(
-            value.min_gas_price,
+        GasPriceServiceConfig::new_v0(
             value.starting_gas_price,
+            value.min_gas_price,
             value.gas_price_change_percent,
             value.gas_price_threshold_percent,
         )

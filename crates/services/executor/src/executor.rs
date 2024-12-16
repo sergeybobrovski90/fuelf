@@ -164,7 +164,14 @@ use alloc::{
 
 /// The maximum amount of transactions that can be included in a block,
 /// excluding the mint transaction.
-pub const MAX_TX_COUNT: u16 = u16::MAX.saturating_sub(1);
+#[cfg(not(feature = "test-helpers"))]
+pub const fn max_tx_count() -> u16 {
+    u16::MAX.saturating_sub(1)
+}
+#[cfg(feature = "test-helpers")]
+pub const fn max_tx_count() -> u16 {
+    1024
+}
 
 pub struct OnceTransactionsSource {
     transactions: ParkingMutex<Vec<MaybeCheckedTransaction>>,
@@ -593,7 +600,7 @@ where
         // When processing l2 transactions, we must take into account transactions from the l1
         // that have been included in the block already (stored in `data.tx_count`), as well
         // as the final mint transaction.
-        let mut remaining_tx_count = MAX_TX_COUNT.saturating_sub(data.tx_count);
+        let mut remaining_tx_count = max_tx_count().saturating_sub(data.tx_count);
 
         let mut regular_tx_iter = l2_tx_source
             .next(
@@ -607,9 +614,16 @@ where
         while regular_tx_iter.peek().is_some() {
             for transaction in regular_tx_iter {
                 let tx_id = transaction.id(&self.consensus_params.chain_id());
-                if transaction.max_gas(&self.consensus_params)? > remaining_gas_limit {
-                    data.skipped_transactions
-                        .push((tx_id, ExecutorError::GasOverflow));
+                let tx_max_gas = transaction.max_gas(&self.consensus_params)?;
+                if tx_max_gas > remaining_gas_limit {
+                    data.skipped_transactions.push((
+                        tx_id,
+                        ExecutorError::GasOverflow(
+                            format!("Transaction cannot fit in remaining gas limit: ({remaining_gas_limit})."),
+                            tx_max_gas,
+                            remaining_gas_limit,
+                        ),
+                    ));
                     continue;
                 }
                 match self.execute_transaction_and_commit(
@@ -629,7 +643,7 @@ where
                 remaining_gas_limit = block_gas_limit.saturating_sub(data.used_gas);
                 remaining_block_transaction_size_limit =
                     block_transaction_size_limit.saturating_sub(data.used_size);
-                remaining_tx_count = MAX_TX_COUNT.saturating_sub(data.tx_count);
+                remaining_tx_count = max_tx_count().saturating_sub(data.tx_count);
             }
 
             regular_tx_iter = l2_tx_source
@@ -923,6 +937,7 @@ where
                             block_height,
                             &self.consensus_params,
                             memory,
+                            block_storage_tx,
                         );
                         match checked_tx_res {
                             Ok(checked_tx) => {
@@ -949,12 +964,16 @@ where
     }
 
     /// Parse forced transaction payloads and perform basic checks
-    fn validate_forced_tx(
+    fn validate_forced_tx<D>(
         relayed_tx: RelayedTransaction,
         block_height: BlockHeight,
         consensus_params: &ConsensusParameters,
         memory: &mut MemoryInstance,
-    ) -> Result<CheckedTransaction, ForcedTransactionFailure> {
+        block_storage_tx: &BlockStorageTransaction<D>,
+    ) -> Result<CheckedTransaction, ForcedTransactionFailure>
+    where
+        D: KeyValueInspect<Column = Column>,
+    {
         let parsed_tx = Self::parse_tx_bytes(&relayed_tx)?;
         Self::tx_is_valid_variant(&parsed_tx)?;
         Self::relayed_tx_claimed_enough_max_gas(
@@ -962,8 +981,13 @@ where
             &relayed_tx,
             consensus_params,
         )?;
-        let checked_tx =
-            Self::get_checked_tx(parsed_tx, block_height, consensus_params, memory)?;
+        let checked_tx = Self::get_checked_tx(
+            parsed_tx,
+            block_height,
+            consensus_params,
+            memory,
+            block_storage_tx,
+        )?;
         Ok(CheckedTransaction::from(checked_tx))
     }
 
@@ -976,14 +1000,23 @@ where
         Ok(tx)
     }
 
-    fn get_checked_tx(
+    fn get_checked_tx<D>(
         tx: Transaction,
         height: BlockHeight,
         consensus_params: &ConsensusParameters,
         memory: &mut MemoryInstance,
-    ) -> Result<Checked<Transaction>, ForcedTransactionFailure> {
+        block_storage_tx: &BlockStorageTransaction<D>,
+    ) -> Result<Checked<Transaction>, ForcedTransactionFailure>
+    where
+        D: KeyValueInspect<Column = Column>,
+    {
         let checked_tx = tx
-            .into_checked_reusable_memory(height, consensus_params, memory)
+            .into_checked_reusable_memory(
+                height,
+                consensus_params,
+                memory,
+                block_storage_tx,
+            )
             .map_err(ForcedTransactionFailure::CheckError)?;
         Ok(checked_tx)
     }
@@ -1438,10 +1471,13 @@ where
             .coinbase
             .checked_add(tx_fee)
             .ok_or(ExecutorError::FeeOverflow)?;
-        execution_data.used_gas = execution_data
-            .used_gas
-            .checked_add(used_gas)
-            .ok_or(ExecutorError::GasOverflow)?;
+        execution_data.used_gas = execution_data.used_gas.checked_add(used_gas).ok_or(
+            ExecutorError::GasOverflow(
+                "Execution used gas overflowed.".into(),
+                execution_data.used_gas,
+                used_gas,
+            ),
+        )?;
         execution_data.used_size = execution_data
             .used_size
             .checked_add(used_size)
@@ -1521,7 +1557,7 @@ where
         &self,
         mut checked_tx: Checked<Tx>,
         header: &PartialBlockHeader,
-        storage_tx: &mut TxStorageTransaction<T>,
+        storage_tx: &TxStorageTransaction<T>,
         memory: &mut MemoryInstance,
     ) -> ExecutorResult<Checked<Tx>>
     where
@@ -1530,7 +1566,11 @@ where
         T: KeyValueInspect<Column = Column>,
     {
         checked_tx = checked_tx
-            .check_predicates(&CheckPredicateParams::from(&self.consensus_params), memory)
+            .check_predicates(
+                &CheckPredicateParams::from(&self.consensus_params),
+                memory,
+                storage_tx,
+            )
             .map_err(|e| {
                 ExecutorError::TransactionValidity(TransactionValidityError::Validation(
                     e,
@@ -1790,9 +1830,14 @@ where
                 gas_price,
             )
             .ok_or(ExecutorError::FeeOverflow)?;
-        let total_used_gas = min_gas
-            .checked_add(used_gas)
-            .ok_or(ExecutorError::GasOverflow)?;
+        let total_used_gas =
+            min_gas
+                .checked_add(used_gas)
+                .ok_or(ExecutorError::GasOverflow(
+                    "Total used gas overflowed.".into(),
+                    min_gas,
+                    used_gas,
+                ))?;
         // if there's no script result (i.e. create) then fee == base amount
         Ok((
             total_used_gas,
