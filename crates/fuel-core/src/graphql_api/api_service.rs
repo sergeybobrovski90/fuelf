@@ -15,7 +15,10 @@ use crate::{
         view_extension::ViewExtension,
         Config,
     },
-    graphql_api,
+    graphql_api::{
+        self,
+        required_fuel_block_height_extension::RequiredFuelBlockHeightExtension,
+    },
     schema::{
         CoreSchema,
         CoreSchemaBuilder,
@@ -34,6 +37,7 @@ use axum::{
     extract::{
         DefaultBodyLimit,
         Extension,
+        FromRequest,
     },
     http::{
         header::{
@@ -42,11 +46,13 @@ use axum::{
             ACCESS_CONTROL_ALLOW_ORIGIN,
         },
         HeaderValue,
+        StatusCode,
     },
     response::{
         sse::Event,
         Html,
         IntoResponse,
+        IntoResponseParts,
         Sse,
     },
     routing::{
@@ -69,6 +75,7 @@ use futures::Stream;
 use hyper::rt::Executor;
 use serde_json::json;
 use std::{
+    convert::Infallible,
     future::Future,
     net::{
         SocketAddr,
@@ -77,6 +84,7 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
+use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
@@ -85,10 +93,16 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+pub(crate) const REQUIRED_FUEL_BLOCK_HEIGHT_HEADER: &str = "REQUIRED_FUEL_BLOCK_HEIGHT";
+pub(crate) const CURRENT_FUEL_BLOCK_HEIGHT_HEADER: &str = "CURRENT_FUEL_BLOCK_HEIGHT";
+
 pub type Service = fuel_core_services::ServiceRunner<GraphqlService>;
 
 pub use super::database::ReadDatabase;
-use super::ports::worker;
+use super::{
+    ports::worker,
+    required_fuel_block_height_extension::RequiredFuelBlockHeightTooFarInTheFuture,
+};
 
 pub type BlockProducer = Box<dyn BlockProducerPort>;
 // In the future GraphQL should not be aware of `TxPool`. It should
@@ -274,6 +288,9 @@ where
         ))
         .extension(async_graphql::extensions::Tracing)
         .extension(ViewExtension::new())
+        // `RequiredFuelBlockHeightExtension` uses the view set by the ViewExtension.
+        // Do not reorder this line before adding the `ViewExtension`.
+        .extension(RequiredFuelBlockHeightExtension::new())
         .finish();
 
     let graphql_endpoint = "/v1/graphql";
@@ -346,19 +363,114 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "up": true }))
 }
 
+/// Optional value which is set via the REQUIRED_FUEL_BLOCK_HEIGHT_HEADER header.
+/// When present, it is used to check whether the current block height is lower
+/// than the current fuel block height. Requests that do not meet this
+/// condition fail with a 412 `Precondition Failed` status code.
+#[derive(Clone)]
+pub(crate) struct RequiredHeight(pub(crate) Option<BlockHeight>);
+
+#[async_trait::async_trait]
+impl<Body> FromRequest<Body> for RequiredHeight
+where
+    Body: Send,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request(
+        req: &mut axum::extract::RequestParts<Body>,
+    ) -> Result<Self, Self::Rejection> {
+        let required_fuel_block_height = req
+            .headers()
+            .get(REQUIRED_FUEL_BLOCK_HEIGHT_HEADER)
+            .map(|value| value.to_str())
+            .transpose()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Header Malformed".to_string()))?
+            .map(|value| value.parse::<u32>())
+            .transpose()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Header Malformed".to_string()))?;
+
+        Ok(RequiredHeight(
+            required_fuel_block_height.map(BlockHeight::new),
+        ))
+    }
+}
+
+/// Structure to be used to store the current fuel block height
+/// in the graphql `RequiredFuelBlockHeightExtension`.
+/// Instances of this type returned by the [RequiredFuelBlockHeightExtension]
+/// are used to se the `CURRENT_FUEL_BLOCK_HEIGHT` header in the response.
+
+struct CurrentHeight(BlockHeight);
+
+impl IntoResponseParts for CurrentHeight {
+    type Error = Infallible;
+
+    fn into_response_parts(
+        self,
+        mut res: axum::response::ResponseParts,
+    ) -> Result<axum::response::ResponseParts, Self::Error> {
+        let current_block_height: u32 = self.0.into();
+        res.headers_mut().insert(
+            CURRENT_FUEL_BLOCK_HEIGHT_HEADER,
+            current_block_height.into(),
+        );
+        Ok(res)
+    }
+}
+
+impl IntoResponse for CurrentHeight {
+    fn into_response(self) -> axum::response::Response {
+        (self, ()).into_response()
+    }
+}
+
 async fn graphql_handler(
+    required_fuel_block_height: RequiredHeight,
     schema: Extension<CoreSchema>,
     req: Json<Request>,
-) -> Json<Response> {
-    schema.execute(req.0).await.into()
+) -> Result<(CurrentHeight, Json<Response>), (StatusCode, CurrentHeight)> {
+    let current_fuel_block_height_data: Arc<Mutex<Option<BlockHeight>>> =
+        Arc::new(Mutex::new(None));
+
+    let request = req
+        .0
+        .data(current_fuel_block_height_data.clone())
+        .data(required_fuel_block_height);
+
+    let graphql_response: Response = schema.execute(request).await;
+
+    let current_block_height = CurrentHeight(
+        current_fuel_block_height_data
+            .lock()
+            .await
+            .expect("Block height is set"),
+    );
+
+    if graphql_response
+        .errors
+        .first()
+        .and_then(|err| err.source::<RequiredFuelBlockHeightTooFarInTheFuture>())
+        .is_some()
+    {
+        Err((StatusCode::PRECONDITION_FAILED, current_block_height))
+    } else {
+        Ok((current_block_height, graphql_response.into()))
+    }
 }
 
 async fn graphql_subscription_handler(
     schema: Extension<CoreSchema>,
     req: Json<Request>,
 ) -> Sse<impl Stream<Item = anyhow::Result<Event, serde_json::Error>>> {
+    let current_fuel_block_height_data: Arc<Mutex<Option<BlockHeight>>> =
+        Arc::new(Mutex::new(None));
+    let request = req
+        .0
+        .data(RequiredHeight(None))
+        .data(current_fuel_block_height_data);
     let stream = schema
-        .execute_stream(req.0)
+        .execute_stream(request)
         .map(|r| Event::default().json_data(r));
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new().text("keep-alive-text"))
