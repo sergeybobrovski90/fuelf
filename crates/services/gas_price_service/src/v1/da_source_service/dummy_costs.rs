@@ -22,11 +22,13 @@ impl DummyDaBlockCosts {
 
 #[async_trait::async_trait]
 impl DaBlockCostsSource for DummyDaBlockCosts {
-    async fn request_da_block_cost(&mut self) -> DaBlockCostsResult<DaBlockCosts> {
+    async fn request_da_block_cost(
+        &mut self,
+    ) -> DaBlockCostsResult<Option<DaBlockCosts>> {
         match &self.value {
             Ok(da_block_costs) => {
                 self.notifier.notify_waiters();
-                Ok(da_block_costs.clone())
+                Ok(Some(da_block_costs.clone()))
             }
             Err(err) => {
                 self.notifier.notify_waiters();

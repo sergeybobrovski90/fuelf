@@ -15,7 +15,7 @@ use serde::{
 };
 
 #[async_trait::async_trait]
-trait BlockCommitterApi: Send + Sync {
+pub trait BlockCommitterApi: Send + Sync {
     /// Used on first run to get the latest costs and seqno
     async fn get_latest_costs(&self) -> DaBlockCostsResult<Option<RawDaBlockCosts>>;
     /// Used to get the costs for a specific seqno
@@ -81,7 +81,9 @@ impl<BlockCommitter> DaBlockCostsSource for BlockCommitterDaBlockCosts<BlockComm
 where
     BlockCommitter: BlockCommitterApi,
 {
-    async fn request_da_block_cost(&mut self) -> DaBlockCostsResult<DaBlockCosts> {
+    async fn request_da_block_cost(
+        &mut self,
+    ) -> DaBlockCostsResult<Option<DaBlockCosts>> {
         let raw_da_block_costs = match self.last_raw_da_block_costs {
             Some(ref last_value) => {
                 self.client.get_costs_by_seqno(last_value.bundle_id + 1)
@@ -91,7 +93,10 @@ where
         .await?;
 
         let Some(ref raw_da_block_costs) = raw_da_block_costs else {
-            return Err(anyhow!("No response from block committer"))
+            // TODO: This is really annoying if there haven't been any costs yet. Do we need this?
+            //   Gonna return `Option::None` for now
+            // return Err(anyhow!("No response from block committer"))
+            return Ok(None)
         };
 
         let da_block_costs = self.last_raw_da_block_costs.iter().fold(
@@ -115,7 +120,7 @@ where
         )?;
 
         self.last_raw_da_block_costs = Some(raw_da_block_costs.clone());
-        Ok(da_block_costs)
+        Ok(Some(da_block_costs))
     }
     async fn set_last_value(&mut self, bundle_id: u32) -> DaBlockCostsResult<()> {
         self.last_raw_da_block_costs = self.client.get_costs_by_seqno(bundle_id).await?;
@@ -125,11 +130,11 @@ where
 
 pub struct BlockCommitterHttpApi {
     client: reqwest::Client,
-    url: String,
+    url: Option<String>,
 }
 
 impl BlockCommitterHttpApi {
-    pub fn new(url: String) -> Self {
+    pub fn new(url: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             url,
@@ -140,42 +145,52 @@ impl BlockCommitterHttpApi {
 #[async_trait::async_trait]
 impl BlockCommitterApi for BlockCommitterHttpApi {
     async fn get_latest_costs(&self) -> DaBlockCostsResult<Option<RawDaBlockCosts>> {
-        let response = self
-            .client
-            .get(&self.url)
-            .send()
-            .await?
-            .json::<RawDaBlockCosts>()
-            .await?;
-        Ok(Some(response))
+        if let Some(url) = &self.url {
+            let val = self.client.get(url).send().await?;
+            tracing::warn!("val: {:?}", val);
+            let response = val.json::<Option<RawDaBlockCosts>>().await?;
+            tracing::warn!("Response: {:?}", response);
+            Ok(response)
+        } else {
+            Ok(None)
+        }
     }
 
     async fn get_costs_by_seqno(
         &self,
         number: u32,
     ) -> DaBlockCostsResult<Option<RawDaBlockCosts>> {
-        let response = self
-            .client
-            .get(format!("{}/{}", self.url, number))
-            .send()
-            .await?
-            .json::<RawDaBlockCosts>()
-            .await?;
-        Ok(Some(response))
+        if let Some(url) = &self.url {
+            let val = self
+                .client
+                .get(format!("{}/{}", url, number))
+                .send()
+                .await?;
+            tracing::warn!("val: {:?}", val);
+            let response = val.json::<Option<RawDaBlockCosts>>().await?;
+            tracing::warn!("Response: {:?}", response);
+            Ok(response)
+        } else {
+            Ok(None)
+        }
     }
 
     async fn get_cost_bundles_by_range(
         &self,
         range: core::ops::Range<u32>,
     ) -> DaBlockCostsResult<Vec<Option<RawDaBlockCosts>>> {
-        let response = self
-            .client
-            .get(format!("{}/{}-{}", self.url, range.start, range.end))
-            .send()
-            .await?
-            .json::<Vec<RawDaBlockCosts>>()
-            .await?;
-        Ok(response.into_iter().map(Some).collect())
+        if let Some(url) = &self.url {
+            let response = self
+                .client
+                .get(format!("{}/{}-{}", url, range.start, range.end))
+                .send()
+                .await?
+                .json::<Vec<RawDaBlockCosts>>()
+                .await?;
+            Ok(response.into_iter().map(Some).collect())
+        } else {
+            Ok(vec![])
+        }
     }
 }
 
@@ -242,7 +257,7 @@ mod tests {
     ) {
         // given
         let da_block_costs = test_da_block_costs();
-        let expected = (&da_block_costs).into();
+        let expected = Some((&da_block_costs).into());
         let mock_api = MockBlockCommitterApi::new(Some(da_block_costs));
         let mut block_committer = BlockCommitterDaBlockCosts::new(mock_api, None);
 
@@ -266,21 +281,22 @@ mod tests {
         let actual = block_committer.request_da_block_cost().await.unwrap();
 
         // then
-        assert_ne!(da_block_costs.blocks_heights, actual.l2_blocks);
+        assert_ne!(da_block_costs.blocks_heights, actual.unwrap().l2_blocks);
     }
 
-    #[tokio::test]
-    async fn request_da_block_cost__when_response_is_none__then_error() {
-        // given
-        let mock_api = MockBlockCommitterApi::new(None);
-        let mut block_committer = BlockCommitterDaBlockCosts::new(mock_api, None);
-
-        // when
-        let result = block_committer.request_da_block_cost().await;
-
-        // then
-        assert!(result.is_err());
-    }
+    // TODO: Do we need this?
+    // #[tokio::test]
+    // async fn request_da_block_cost__when_response_is_none__then_error() {
+    //     // given
+    //     let mock_api = MockBlockCommitterApi::new(None);
+    //     let mut block_committer = BlockCommitterDaBlockCosts::new(mock_api, None);
+    //
+    //     // when
+    //     let result = block_committer.request_da_block_cost().await;
+    //
+    //     // then
+    //     assert!(result.is_err());
+    // }
 
     struct UnderflowingMockBlockCommitterApi {
         value: Option<RawDaBlockCosts>,

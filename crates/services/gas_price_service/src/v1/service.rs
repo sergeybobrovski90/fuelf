@@ -45,6 +45,8 @@ use async_trait::async_trait;
 use fuel_core_services::{
     RunnableService,
     RunnableTask,
+    Service,
+    ServiceRunner,
     StateWatcher,
     TaskNextAction,
 };
@@ -61,7 +63,11 @@ use futures::FutureExt;
 use tokio::sync::broadcast::Receiver;
 
 /// The service that updates the gas price algorithm.
-pub struct GasPriceServiceV1<L2, DA, StorageTxProvider> {
+pub struct GasPriceServiceV1<L2, DA, AtomicStorage>
+where
+    DA: DaBlockCostsSource + 'static,
+    AtomicStorage: GasPriceServiceAtomicStorage,
+{
     /// The algorithm that can be used in the next block
     shared_algo: SharedV1Algorithm,
     /// The L2 block source
@@ -69,13 +75,13 @@ pub struct GasPriceServiceV1<L2, DA, StorageTxProvider> {
     /// The algorithm updater
     algorithm_updater: AlgorithmUpdaterV1,
     /// the da source adapter handle
-    da_source_adapter_handle: DaSourceService<DA>,
+    da_source_adapter_handle: ServiceRunner<DaSourceService<DA>>,
     /// The da source channel
     da_source_channel: Receiver<DaBlockCosts>,
     /// Buffer of block costs from the DA chain
     da_block_costs_buffer: Vec<DaBlockCosts>,
     /// Storage transaction provider for metadata and unrecorded blocks
-    storage_tx_provider: StorageTxProvider,
+    storage_tx_provider: AtomicStorage,
 }
 
 impl<L2, DA, AtomicStorage> GasPriceServiceV1<L2, DA, AtomicStorage>
@@ -106,11 +112,10 @@ where
         l2_block_source: L2,
         shared_algo: SharedV1Algorithm,
         algorithm_updater: AlgorithmUpdaterV1,
-        da_source_adapter_handle: DaSourceService<DA>,
+        da_source_adapter_handle: ServiceRunner<DaSourceService<DA>>,
         storage_tx_provider: AtomicStorage,
     ) -> Self {
-        let da_source_channel =
-            da_source_adapter_handle.shared_data().clone().subscribe();
+        let da_source_channel = da_source_adapter_handle.shared.clone().subscribe();
         Self {
             shared_algo,
             l2_block_source,
@@ -178,12 +183,19 @@ where
                 .map_err(|err| anyhow!(err))?;
         }
 
+        if let Some(bundle_id) = bundle_id {
+            storage_tx
+                .set_bundle_id(&BlockHeight::from(height), bundle_id)
+                .map_err(|err| anyhow!(err))?;
+        }
+
+        let fee_in_wei = u128::from(block_fees).saturating_mul(1_000_000_000);
         self.algorithm_updater.update_l2_block_data(
             height,
             gas_used,
             capacity,
             block_bytes,
-            block_fees as u128,
+            fee_in_wei,
             &mut storage_tx.as_unrecorded_blocks(),
         )?;
 
@@ -193,6 +205,7 @@ where
             .map_err(|err| anyhow!(err))?;
         AtomicStorage::commit_transaction(storage_tx)?;
         let new_algo = self.algorithm_updater.algorithm();
+        tracing::debug!("Updating gas price: {}", &new_algo.calculate());
         self.shared_algo.update(new_algo).await;
         // Clear the buffer after committing changes
         self.da_block_costs_buffer.clear();
@@ -277,7 +290,7 @@ where
         }
 
         // run shutdown hooks for internal services
-        self.da_source_adapter_handle.shutdown().await?;
+        self.da_source_adapter_handle.stop_and_await().await?;
 
         Ok(())
     }
@@ -340,6 +353,8 @@ mod tests {
 
     use fuel_core_services::{
         RunnableTask,
+        Service,
+        ServiceRunner,
         StateWatcher,
     };
     use fuel_core_storage::{
@@ -431,6 +446,7 @@ mod tests {
             Ok(metadata)
         }
     }
+
     fn database() -> StorageTransaction<InMemoryStorage<GasPriceColumn>> {
         InMemoryStorage::default().into_transaction()
     }
@@ -468,6 +484,7 @@ mod tests {
             capped_range_size: 100,
             decrease_range_size: 4,
             block_activity_threshold: 20,
+            da_poll_interval: None,
         };
         let inner = database();
         let (algo_updater, shared_algo) =
@@ -481,12 +498,14 @@ mod tests {
             ),
             None,
         );
+        let da_service_runner = ServiceRunner::new(dummy_da_source);
+        da_service_runner.start_and_await().await.unwrap();
 
         let mut service = GasPriceServiceV1::new(
             l2_block_source,
             shared_algo,
             algo_updater,
-            dummy_da_source,
+            da_service_runner,
             inner,
         );
         let read_algo = service.next_block_algorithm();
@@ -536,6 +555,7 @@ mod tests {
             capped_range_size: 100,
             decrease_range_size: 4,
             block_activity_threshold: 20,
+            da_poll_interval: None,
         };
         let mut inner = database();
         let mut tx = inner.write_transaction();
@@ -556,7 +576,7 @@ mod tests {
                 Ok(DaBlockCosts {
                     bundle_id: 1,
                     l2_blocks: (1..2).collect(),
-                    blob_cost_wei: 9000,
+                    blob_cost_wei: u128::MAX, // Very expensive to trigger a change
                     bundle_size_bytes: 3000,
                 }),
                 notifier.clone(),
@@ -564,33 +584,26 @@ mod tests {
             Some(Duration::from_millis(1)),
         );
         let mut watcher = StateWatcher::started();
+        let da_service_runner = ServiceRunner::new(da_source);
+        da_service_runner.start_and_await().await.unwrap();
 
         let mut service = GasPriceServiceV1::new(
             l2_block_source,
             shared_algo,
             algo_updater,
-            da_source,
+            da_service_runner,
             inner,
         );
         let read_algo = service.next_block_algorithm();
         let initial_price = read_algo.next_gas_price();
 
-        // the RunnableTask depends on the handle passed to it for the da block cost source to already be running,
-        // which is the responsibility of the UninitializedTask in the `into_task` method of the RunnableService
-        // here we mimic that behaviour by running the da block cost service.
-        let mut da_source_watcher = StateWatcher::started();
-        service
-            .da_source_adapter_handle
-            .run(&mut da_source_watcher)
-            .await;
-
         service.run(&mut watcher).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(3)).await;
         l2_block_sender.send(l2_block_2).await.unwrap();
 
         // when
         service.run(&mut watcher).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(3)).await;
         service.shutdown().await.unwrap();
 
         // then
@@ -613,6 +626,7 @@ mod tests {
             capped_range_size: 100,
             decrease_range_size: 4,
             block_activity_threshold: 20,
+            da_poll_interval: None,
         }
     }
 
@@ -664,25 +678,18 @@ mod tests {
             Some(Duration::from_millis(1)),
         );
         let mut watcher = StateWatcher::started();
+        let da_service_runner = ServiceRunner::new(da_source);
+        da_service_runner.start_and_await().await.unwrap();
 
         let mut service = GasPriceServiceV1::new(
             l2_block_source,
             shared_algo,
             algo_updater,
-            da_source,
+            da_service_runner,
             inner,
         );
         let read_algo = service.next_block_algorithm();
         let initial_price = read_algo.next_gas_price();
-
-        // the RunnableTask depends on the handle passed to it for the da block cost source to already be running,
-        // which is the responsibility of the UninitializedTask in the `into_task` method of the RunnableService
-        // here we mimic that behaviour by running the da block cost service.
-        let mut da_source_watcher = StateWatcher::started();
-        service
-            .da_source_adapter_handle
-            .run(&mut da_source_watcher)
-            .await;
 
         service.run(&mut watcher).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
